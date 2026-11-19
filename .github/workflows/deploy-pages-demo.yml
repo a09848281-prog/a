@@ -1,0 +1,51 @@
+name: Deploy Remote Camera v4.5.1 Demo to GitHub Pages
+on:
+  push:
+    branches: [demo-v4.5.1]
+    paths:
+      - "web/**"
+      - ".github/workflows/deploy-pages-demo.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: github-pages-demo
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: \${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - name: Validate and package web application
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s web/index.html
+          test -s web/app.js
+          test -s web/app.css
+          test -s web/config.json
+          test -s web/manifest.webmanifest
+          test -s web/sw.js
+          node --check web/app.js
+          node --check web/sw.js
+          node -e 'const c=require("./web/config.json"); if(c.appVersion!=="4.5.1"||!c.gasUrl.endsWith("/exec")) throw new Error("Invalid GAS config");'
+          mkdir -p _site
+          cp -a web/. _site/
+          test -s _site/index.html
+          echo "Remote Camera v4.5.1 Demo site packaged."
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

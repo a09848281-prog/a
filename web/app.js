@@ -1,0 +1,2542 @@
+"use strict";
+
+const $ = id => document.getElementById(id);
+const STORAGE_KEY = "rc_paired_devices_v42";
+const SELECTED_KEY = "rc_selected_device_v42";
+const S = {
+  cfg: null,
+  devices: [],
+  device: null,
+  pc: null,
+  mic: null,
+  remoteAudioTracks: [],
+  pttActive: false,
+  pttLocked: false,
+  remoteAudioMuted: false,
+  remoteAnalyser: null,
+  audioMeterFrame: null,
+  pttSafetyTimer: null,
+  session: "",
+  seq: 0,
+  map: null,
+  marker: null,
+  route: null,
+  history: [],
+  lastLocation: null,
+  followMap: true,
+  zoom: 1,
+  fitMode: "contain",
+  reconnectTimer: null,
+  reconnectResetTimer: null,
+  reconnectAttempts: 0,
+  manualDisconnect: false,
+  statsTimer: null,
+  statsBusy: false,
+  previousStats: null,
+  statsFreezeCount: 0,
+  hasReceivedVideoFrame: false,
+  videoWatchdogTimer: null,
+  videoFrameCallbackId: null,
+  videoUsesFrameCallback: false,
+  lastVideoFrameAt: 0,
+  audioContext: null,
+  remoteGain: null,
+  remoteAudioSource: null,
+  remoteVideoStream: null,
+  receiveVolume: 70,
+  androidSpeakerVolume: 70,
+  captureRatio: "16:9",
+  fpsLimit: 24,
+  appliedAdaptiveMode: "standard",
+  adaptiveLastChangeAt: 0,
+  adaptiveStableSince: 0,
+  flashlightOn: false,
+  flashlightAvailable: false,
+  flashlightPending: false,
+  voiceCleanLevel: 0,
+  remoteHighpass: null,
+  remoteLowpass: null,
+  remoteCompressor: null,
+  remoteGate: null,
+  remoteGateTarget: 1,
+  monitorStartedAt: 0,
+  monitorElapsedMs: 0,
+  monitorRxBytes: -1,
+  monitorTxBytes: -1,
+  monitorClockTimer: null,
+  sessionBytes: 0,
+  wakeLock: null,
+  keepAwakeWanted: false,
+  androidStatusTimer: null,
+  settingsSaveChain: Promise.resolve(),
+  controlChannel: null,
+  lastGasServerMs: null,
+  lastGasApiVersion: "",
+  sessionTimer: null,
+  connectedAt: 0,
+  motionTimer: null,
+  motionPrevious: null,
+  motionLastTriggered: 0,
+  motionEvents: [],
+  motionZones: [],
+  motionSelectedZoneId: "",
+  motionDrawingEnabled: false,
+  motionDraft: null,
+  personZoneStates: {},
+  viewerHeartbeatTimer: null,
+  imageViewerSource: "",
+  imageViewerFilename: "",
+  imageObjectUrl: ""
+};
+
+const STORAGE_NAMESPACE = "remote-camera-v451-demo:";
+function storageKey(key) { return STORAGE_NAMESPACE + String(key); }
+function storageGet(key, fallback = "") {
+  try {
+    const value = localStorage.getItem(storageKey(key));
+    return value === null ? fallback : value;
+  } catch (_) {
+    return fallback;
+  }
+}
+function storageSet(key, value) {
+  try {
+    localStorage.setItem(storageKey(key), String(value));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+function storageRemove(key) {
+  try {
+    localStorage.removeItem(storageKey(key));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+function notifyBookmarkletPanel(action) {
+  const isBookmarkletEmbed = new URLSearchParams(location.search).get("embed") === "bookmarklet";
+  if (!isBookmarkletEmbed || window.parent === window) return;
+  try {
+    window.parent.postMessage({
+      channel: "remote-camera-v42-bookmarklet",
+      action: action
+    }, "*");
+  } catch (error) {
+    console.debug("Bookmarklet panel resize request skipped", error);
+  }
+}
+function rid() {
+  return (crypto.randomUUID && crypto.randomUUID()) ||
+    (Date.now().toString(36) + Math.random().toString(36).slice(2));
+}
+function toast(text) {
+  $("toast").textContent = text;
+  $("toast").classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => $("toast").classList.remove("show"), 3200);
+}
+function status(text, online = false) {
+  $("status").textContent = text;
+  $("status").className = "pill" + (online ? " online" : "");
+}
+function message(id, text, good = false) {
+  $(id).textContent = text;
+  $(id).style.color = good ? "#16714d" : "#b43e48";
+}
+function readDevices() {
+  try {
+    const parsed = JSON.parse(storageGet(STORAGE_KEY, "[]"));
+    return Array.isArray(parsed) ? parsed.filter(x =>
+      x && typeof x.deviceId === "string" &&
+      typeof x.controllerToken === "string" && x.controllerToken.length > 20
+    ) : [];
+  } catch (_) {
+    return [];
+  }
+}
+function saveDevices() {
+  return storageSet(STORAGE_KEY, JSON.stringify(S.devices));
+}
+async function loadConfig() {
+  const response = await fetch("./config.json", { cache: "no-store" });
+  if (!response.ok) throw Error("config.jsonを読み込めません。");
+  S.cfg = await response.json();
+  if (!S.cfg.gasUrl || !S.cfg.gasUrl.endsWith("/exec") ||
+      S.cfg.gasUrl.includes("PASTE_YOUR_DEPLOYMENT_ID")) {
+    throw Error("web/config.json の gasUrl にGASの /exec URLを設定してください。");
+  }
+}
+
+/**
+ * GAS HTML response is returned through a hidden iframe.
+ * Match both the request ID and the exact iframe window before accepting it.
+ */
+function apiOnce(action, data = {}) {
+  return new Promise((resolve, reject) => {
+    const id = rid();
+    const frame = document.createElement("iframe");
+    const form = document.createElement("form");
+    frame.name = "gas_" + id;
+    frame.title = "GAS response";
+    frame.tabIndex = -1;
+    frame.setAttribute("aria-hidden", "true");
+    // Keep the iframe renderable: iOS Safari can be unreliable with hidden form targets.
+    frame.style.cssText = "position:fixed;width:1px;height:1px;left:-2px;top:-2px;opacity:0;pointer-events:none;border:0";
+    form.hidden = true;
+    form.method = "POST";
+    form.action = S.cfg.gasUrl;
+    form.target = frame.name;
+
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = "payload";
+    input.value = JSON.stringify({ action, requestId: id, clientOrigin: location.origin, ...data });
+    form.appendChild(input);
+    document.body.append(frame, form);
+
+    let finished = false;
+    const timer = setTimeout(() => {
+      const error = Error("GAS応答がタイムアウトしました。安全な読み取り操作を自動再試行します。");
+      error.transient = true;
+      finish(error);
+    }, Number(S.cfg.requestTimeoutMs) || 12000);
+
+    function finish(error, value) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      window.removeEventListener("message", listener);
+      frame.remove();
+      form.remove();
+      if (error) reject(error);
+      else resolve(value);
+    }
+    function listener(event) {
+      // Apps Script HtmlService may nest its sandbox iframe. In that case the
+      // message source is the nested Google frame, not frame.contentWindow.
+      // The random requestId and trusted Google origin below bind the response.
+      if (!event.data || event.data.channel !== "remote-camera-gas" ||
+          event.data.requestId !== id) return;
+      const origin = String(event.origin || "");
+      const allowedOrigin = origin === "https://script.google.com" ||
+        origin === "https://script.googleusercontent.com" ||
+        origin.endsWith(".googleusercontent.com");
+      if (!allowedOrigin) return;
+      const result = event.data.result;
+      if (result && Number.isFinite(Number(result.serverMs))) {
+        S.lastGasServerMs = Number(result.serverMs);
+        S.lastGasApiVersion = String(result.apiVersion || "");
+        if ($("gasTiming")) {
+          $("gasTiming").textContent = "GAS処理 " + S.lastGasServerMs + " ms" +
+            (S.lastGasApiVersion ? " / API " + S.lastGasApiVersion : "");
+        }
+      }
+      if (!result || result.ok !== true) {
+        const error = Error(result && result.error ? result.error : "GAS APIエラー");
+        error.serverMs = result && Number.isFinite(Number(result.serverMs)) ? Number(result.serverMs) : null;
+        error.apiVersion = result && result.apiVersion ? String(result.apiVersion) : "";
+        finish(error);
+      } else {
+        finish(null, result);
+      }
+    }
+    window.addEventListener("message", listener);
+    try {
+      form.submit();
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+async function api(action, data = {}) {
+  const safeRead = ["health", "poll_signals", "get_settings", "get_locations"].includes(action);
+  const maxAttempts = safeRead ? 2 : 1;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await apiOnce(action, data);
+    } catch (error) {
+      if (!error.transient || attempt + 1 >= maxAttempts) throw error;
+      await new Promise(resolve => setTimeout(resolve, 350 * (attempt + 1)));
+    }
+  }
+  throw Error("GAS通信に失敗しました。");
+}
+
+function renderDevices() {
+  const box = $("devices");
+  box.replaceChildren();
+  if (!S.devices.length) {
+    const p = document.createElement("p");
+    p.className = "muted";
+    p.textContent = "登録済み端末はありません。Androidで監視待機を開始し、ペアリングしてください。";
+    box.appendChild(p);
+    return;
+  }
+  S.devices.forEach(device => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "deviceitem" + (S.device && S.device.deviceId === device.deviceId ? " selected" : "");
+    const strong = document.createElement("b");
+    const small = document.createElement("small");
+    strong.textContent = device.deviceName || "Android端末";
+    small.textContent = "端末ID: " + device.deviceId.slice(0, 12) + (device.controllerName ? " · " + device.controllerName : "");
+    button.append(strong, small);
+    button.addEventListener("click", () => selectDevice(device));
+    box.appendChild(button);
+  });
+}
+function setControlsEnabled(enabled) {
+  ["connect", "locate", "saveSettings", "history", "deleteHistory", "unpair", "viewers"].forEach(id => {
+    $(id).disabled = !enabled;
+  });
+  $("connect").disabled = !enabled || !!S.pc;
+  $("disconnect").disabled = !S.pc;
+  $("camera").disabled = !enabled || !S.pc;
+  $("ptt").disabled = !S.pc;
+  $("pttLock").disabled = !S.pc;
+  $("remoteMute").disabled = !S.pc;
+  $("androidSpeakerVolume").disabled = !S.pc;
+  $("snapshot").disabled = !S.pc;
+  $("refreshStatus").disabled = !S.pc;
+  if (!S.pc) updateFlashlightButton(false, false);
+}
+function selectDevice(device) {
+  if (S.pc && S.device && S.device.deviceId !== device.deviceId) {
+    toast("接続中の端末があります。先に切断してから端末を切り替えてください。");
+    return;
+  }
+  S.device = device;
+  storageSet(SELECTED_KEY, device.deviceId);
+  $("deviceName").textContent = device.deviceName || "Android端末";
+  $("deviceMeta").textContent = "端末ID: " + device.deviceId + " / 閲覧名: " + (device.controllerName || "このブラウザー");
+  renderDevices();
+  setControlsEnabled(true);
+  status("ペアリング済み");
+  loadSettings().catch(error => toast(error.message));
+}
+function refreshDeviceList() {
+  S.devices = readDevices();
+  renderDevices();
+  if (S.device) {
+    const updated = S.devices.find(x => x.deviceId === S.device.deviceId);
+    if (updated) S.device = updated;
+  }
+  if (!S.device && S.devices.length) {
+    const id = storageGet(SELECTED_KEY, "");
+    selectDevice(S.devices.find(x => x.deviceId === id) || S.devices[0]);
+  } else if (!S.devices.length) {
+    S.device = null;
+    $("deviceName").textContent = "Android端末をペアリングしてください";
+    $("deviceMeta").textContent = "待機中";
+    setControlsEnabled(false);
+    status("未ペアリング");
+  }
+}
+async function claimDevice() {
+  const code = $("pairCode").value.trim();
+  const controllerName = $("pairName").value.trim() || "Web閲覧端末";
+  if (!/^\d{8}$/.test(code)) {
+    message("pairMessage", "8桁の登録コードを入力してください。");
+    return;
+  }
+  $("claim").disabled = true;
+  message("pairMessage", "Android端末と登録枠を確認しています…", true);
+  try {
+    const result = await api("claim_device", { code, controllerName });
+    const device = {
+      deviceId: result.deviceId,
+      deviceName: result.deviceName || "Android端末",
+      controllerId: result.controllerId || "",
+      controllerName: result.controllerName || controllerName,
+      controllerToken: result.controllerToken
+    };
+    S.devices = readDevices().filter(x => x.deviceId !== device.deviceId);
+    S.devices.push(device);
+    const devicesSaved = saveDevices();
+    $("pairCode").value = "";
+    $("pairName").value = "";
+    $("pairDialog").close();
+    refreshDeviceList();
+    selectDevice(device);
+    $("viewerCount").textContent = "閲覧端末: " + (result.viewerCount || 1) + "/" + (result.maxViewers || 3);
+    toast(devicesSaved
+      ? "このブラウザーを閲覧端末として登録しました。"
+      : "登録自体は完了しましたが、このブラウザーはペアリング情報を保存できません。ページを閉じると再登録が必要になる場合があります。");
+  } catch (error) {
+    message("pairMessage", error.message);
+  } finally {
+    $("claim").disabled = false;
+  }
+}
+
+function waitIce(pc, ms) {
+  return new Promise(resolve => {
+    if (pc.iceGatheringState === "complete") return resolve(true);
+    let done = false;
+    let timer = null;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      if (timer !== null) clearTimeout(timer);
+      pc.removeEventListener("icegatheringstatechange", check);
+      resolve(pc.iceGatheringState === "complete");
+    };
+    const check = () => {
+      if (pc.iceGatheringState === "complete") finish();
+    };
+    timer = setTimeout(finish, ms);
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+function formatDuration(milliseconds) {
+  const total = Math.max(0, Math.floor(milliseconds / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return [hours, minutes, seconds].map(value => String(value).padStart(2, "0")).join(":");
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "--";
+  if (bytes < 1024) return bytes.toFixed(0) + " B";
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = bytes / 1024;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) { size /= 1024; index++; }
+  return size.toFixed(size >= 100 ? 0 : size >= 10 ? 1 : 2) + " " + units[index];
+}
+
+function updateMonitorInfo() {
+  const elapsed = S.monitorStartedAt > 0
+    ? Math.max(0, Date.now() - S.monitorStartedAt)
+    : Math.max(0, S.monitorElapsedMs || 0);
+  $("monitorUptime").textContent = S.monitorStartedAt > 0 || S.monitorElapsedMs > 0
+    ? "監視時間 " + formatDuration(elapsed)
+    : "監視時間 --";
+  const total = S.monitorRxBytes >= 0 || S.monitorTxBytes >= 0
+    ? Math.max(0, S.monitorRxBytes) + Math.max(0, S.monitorTxBytes) : -1;
+  $("monitorTraffic").textContent = "端末通信量 " + formatBytes(total);
+  $("viewerTraffic").textContent = "この閲覧端末 " + formatBytes(S.sessionBytes);
+}
+
+function updateCaptureAspectRatio() {
+  const raw = $("captureRatio") ? $("captureRatio").value : "16:9";
+  const parts = String(raw || "16:9").split(":").map(Number);
+  if (parts.length === 2 && parts.every(value => Number.isFinite(value) && value > 0)) {
+    $("videoPane").style.aspectRatio = parts[0] + " / " + parts[1];
+  }
+}
+
+function startSessionClock() {
+  if (S.sessionTimer) return;
+  S.connectedAt = Date.now();
+  const update = () => {
+    $("sessionDuration").textContent = "接続時間 " + formatDuration(Date.now() - S.connectedAt);
+  };
+  update();
+  S.sessionTimer = setInterval(update, 1000);
+}
+
+function stopSessionClock() {
+  if (S.sessionTimer) clearInterval(S.sessionTimer);
+  S.sessionTimer = null;
+  S.connectedAt = 0;
+  if ($("sessionDuration")) $("sessionDuration").textContent = "接続時間 00:00:00";
+}
+
+function stopStatsMonitor() {
+  if (S.statsTimer) clearInterval(S.statsTimer);
+  S.statsTimer = null;
+  S.previousStats = null;
+  S.statsFreezeCount = 0;
+  S.hasReceivedVideoFrame = false;
+  S.statsBusy = false;
+  if ($("connectionMetrics")) $("connectionMetrics").textContent = "通信状態：未接続";
+}
+
+async function collectConnectionStats(pc) {
+  if (!pc || pc !== S.pc || S.statsBusy || typeof pc.getStats !== "function") return;
+  S.statsBusy = true;
+  try {
+    const report = await pc.getStats();
+    if (pc !== S.pc) return;
+    let video = null;
+    let candidatePair = null;
+    let inboundBytes = 0;
+    let outboundBytes = 0;
+    report.forEach(stat => {
+      if (stat.type === "inbound-rtp" && !stat.isRemote) {
+        inboundBytes += Number(stat.bytesReceived) || 0;
+        if (stat.kind === "video" || stat.mediaType === "video") video = stat;
+      }
+      if (stat.type === "outbound-rtp" && !stat.isRemote) {
+        outboundBytes += Number(stat.bytesSent) || 0;
+      }
+      if (stat.type === "candidate-pair" && stat.state === "succeeded" &&
+          (stat.selected || stat.nominated)) candidatePair = stat;
+    });
+    if (!video) return;
+    const pairHasCounters = candidatePair &&
+      typeof candidatePair.bytesReceived === "number" &&
+      typeof candidatePair.bytesSent === "number";
+    const totalBytes = pairHasCounters
+      ? Math.max(0, candidatePair.bytesReceived) + Math.max(0, candidatePair.bytesSent)
+      : inboundBytes + outboundBytes;
+    const current = {
+      timestamp: Number(video.timestamp) || Date.now(),
+      bytes: Number(video.bytesReceived) || 0,
+      totalBytes,
+      packetsReceived: Number(video.packetsReceived) || 0,
+      packetsLost: Number(video.packetsLost) || 0,
+      frames: Number(video.framesDecoded) || 0
+    };
+    const previous = S.previousStats;
+    S.previousStats = current;
+    const rttMs = candidatePair && Number.isFinite(Number(candidatePair.currentRoundTripTime))
+      ? Math.round(Number(candidatePair.currentRoundTripTime) * 1000) : null;
+    if (!previous) {
+      S.sessionBytes = Math.max(S.sessionBytes, current.totalBytes);
+      updateMonitorInfo();
+      if (current.frames > 0) S.hasReceivedVideoFrame = true;
+      $("connectionMetrics").textContent = "通信状態：測定中";
+      return;
+    }
+    const elapsed = Math.max(0.2, (current.timestamp - previous.timestamp) / 1000);
+    const bitrate = Math.max(0, (current.bytes - previous.bytes) * 8 / elapsed / 1000);
+    const trafficDelta = current.totalBytes >= previous.totalBytes
+      ? current.totalBytes - previous.totalBytes : 0;
+    S.sessionBytes += trafficDelta;
+    updateMonitorInfo();
+    const decodedDelta = Math.max(0, current.frames - previous.frames);
+    const fps = decodedDelta / elapsed;
+    if (decodedDelta > 0) {
+      S.hasReceivedVideoFrame = true;
+      S.lastVideoFrameAt = Date.now();
+      $("videoState").textContent = "映像受信中";
+      S.statsFreezeCount = 0;
+    } else if (S.hasReceivedVideoFrame) {
+      S.statsFreezeCount += 1;
+    } else {
+      S.statsFreezeCount = 0;
+    }
+    if (!S.videoUsesFrameCallback && S.statsFreezeCount >= 3 && pc.connectionState === "connected") {
+      toast("映像フレームが止まっています。接続を再構築します。");
+      scheduleReconnect(pc, true);
+      return;
+    }
+    const receivedDelta = Math.max(0, current.packetsReceived - previous.packetsReceived);
+    const lostDelta = Math.max(0, current.packetsLost - previous.packetsLost);
+    const loss = receivedDelta + lostDelta > 0 ? lostDelta / (receivedDelta + lostDelta) * 100 : 0;
+    const grade = loss > 8 || (rttMs !== null && rttMs > 500) || fps < 8
+      ? "不安定" : loss > 3 || (rttMs !== null && rttMs > 280) || fps < 17 ? "注意" : "良好";
+    updateAdaptiveQuality(loss, fps, rttMs);
+    $("connectionMetrics").textContent =
+      "通信 " + grade + "　映像受信 " + bitrate.toFixed(0) + " kbps　" +
+      "映像 " + fps.toFixed(0) + " fps　" +
+      "遅延 " + (rttMs === null ? "--" : rttMs + " ms") + "　" +
+      "損失 " + loss.toFixed(1) + "%";
+  } catch (error) {
+    console.debug("getStats unavailable", error);
+  } finally {
+    S.statsBusy = false;
+  }
+}
+
+function startStatsMonitor(pc) {
+  stopStatsMonitor();
+  collectConnectionStats(pc);
+  S.statsTimer = setInterval(() => collectConnectionStats(pc), 2500);
+}
+
+function scheduleReconnect(failedPeer, forceReconnect = false, initialWait = null) {
+  if (S.manualDisconnect || !S.device || S.reconnectTimer) return;
+  const waits = [2500, 5000, 10000, 15000, 20000];
+  if (S.reconnectAttempts >= waits.length) {
+    toast("自動再接続を終了しました。回線とAndroidの待機状態を確認してください。");
+    return;
+  }
+  const attempt = S.reconnectAttempts + 1;
+  const wait = initialWait === null ? waits[S.reconnectAttempts] : initialWait;
+  status("再接続を準備中", false);
+  $("streamState").textContent = "再接続 " + attempt + "/" + waits.length;
+  S.reconnectTimer = setTimeout(async () => {
+    S.reconnectTimer = null;
+    if (S.manualDisconnect || !S.device || (failedPeer && S.pc !== failedPeer)) return;
+    if (failedPeer && failedPeer.connectionState === "connected" && !forceReconnect) return;
+    S.reconnectAttempts = attempt;
+    await disconnect(false, true);
+    await connect(true);
+  }, wait);
+}
+
+function updateViewerTransform() {
+  const video = $("remoteVideo");
+  video.style.transform = "scale(" + S.zoom + ")";
+  video.style.objectFit = S.fitMode;
+  $("zoomValue").textContent = Math.round(S.zoom * 100) + "%";
+  if (typeof updateMotionOverlayLayout === "function") updateMotionOverlayLayout();
+}
+
+async function toggleFullscreen() {
+  const pane = $("videoPane");
+  const video = $("remoteVideo");
+  try {
+    const isFullscreen = document.fullscreenElement ||
+      document.webkitFullscreenElement || video.webkitDisplayingFullscreen;
+    if (isFullscreen) {
+      if (document.exitFullscreen) await document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      else if (video.webkitExitFullscreen) video.webkitExitFullscreen();
+      window.setTimeout(restoreRemotePlayback, 350);
+    } else if (pane.requestFullscreen) {
+      await pane.requestFullscreen();
+    } else if (pane.webkitRequestFullscreen) {
+      pane.webkitRequestFullscreen();
+    } else if (video.webkitEnterFullscreen) {
+      // iOS native video fullscreen is a last-resort path. Keep the same stream
+      // attached and explicitly resume it when webkitendfullscreen fires.
+      video.webkitEnterFullscreen();
+    } else {
+      toast("このブラウザーは全画面表示に対応していません。");
+    }
+  } catch (error) {
+    toast("全画面表示に失敗しました: " + error.message);
+  }
+}
+
+function restoreRemotePlayback() {
+  const video = $("remoteVideo");
+  if (!S.pc || !S.remoteVideoStream || S.pc.connectionState === "closed") return;
+  try {
+    if (video.srcObject !== S.remoteVideoStream) video.srcObject = S.remoteVideoStream;
+    video.playsInline = true;
+    video.setAttribute("playsinline", "");
+    video.setAttribute("webkit-playsinline", "");
+    if (S.audioContext && S.audioContext.state === "suspended") {
+      S.audioContext.resume().catch(error => console.debug("AudioContext resume failed", error));
+    }
+    const playPromise = video.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch(() => {
+        $("videoState").textContent = "映像は接続中です。画面をタップして再生してください。";
+      });
+    }
+  } catch (error) {
+    console.debug("Remote video resume failed", error);
+  }
+}
+
+async function copyCoordinates() {
+  if (!S.lastLocation) return toast("コピーできる位置情報がありません。");
+  const text = Number(S.lastLocation.lat).toFixed(6) + ", " +
+    Number(S.lastLocation.lng).toFixed(6);
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("座標をコピーしました: " + text);
+  } catch (_) {
+    const input = document.createElement("textarea");
+    input.value = text;
+    document.body.appendChild(input);
+    input.select();
+    const copied = document.execCommand("copy");
+    input.remove();
+    toast(copied ? "座標をコピーしました: " + text : "座標をコピーできませんでした。");
+  }
+}
+
+function prepareAudioOutput() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return false;
+  try {
+    if (!S.audioContext) {
+      S.audioContext = new AudioContextClass();
+      S.remoteGain = S.audioContext.createGain();
+      S.remoteGain.gain.value = S.receiveVolume / 100;
+      S.remoteGain.connect(S.audioContext.destination);
+    }
+    if (S.audioContext.state === "suspended") {
+      S.audioContext.resume().catch(error => console.debug("AudioContext resume failed", error));
+    }
+    return true;
+  } catch (error) {
+    console.warn("Web Audio output setup failed", error);
+    return false;
+  }
+}
+
+function attachRemoteAudio() {
+  const liveTracks = S.remoteAudioTracks.filter(track => track.readyState === "live");
+  if (!liveTracks.length) {
+    stopAudioMeter();
+    if (S.remoteAudioSource) {
+      try { S.remoteAudioSource.disconnect(); } catch (_) {}
+      S.remoteAudioSource = null;
+    }
+    $("audioState").textContent = "Androidマイク待機中";
+    return;
+  }
+  if (!prepareAudioOutput()) {
+    $("remoteVideo").muted = false;
+    setReceiveVolume(S.receiveVolume, false);
+    $("audioState").textContent = "Androidマイク受信中（音声フィルター非対応）";
+    return;
+  }
+  try {
+    if (S.remoteAudioSource) {
+      try { S.remoteAudioSource.disconnect(); } catch (_) {}
+      S.remoteAudioSource = null;
+    }
+    stopAudioMeter();
+    S.remoteAudioSource = S.audioContext.createMediaStreamSource(new MediaStream(liveTracks));
+    S.remoteHighpass = S.audioContext.createBiquadFilter();
+    S.remoteHighpass.type = "highpass";
+    S.remoteLowpass = S.audioContext.createBiquadFilter();
+    S.remoteLowpass.type = "lowpass";
+    S.remoteCompressor = S.audioContext.createDynamicsCompressor();
+    S.remoteGate = S.audioContext.createGain();
+    S.remoteGateTarget = 1;
+    S.remoteAnalyser = S.audioContext.createAnalyser();
+    S.remoteAnalyser.fftSize = 512;
+    S.remoteAudioSource.connect(S.remoteHighpass);
+    S.remoteHighpass.connect(S.remoteLowpass);
+    S.remoteLowpass.connect(S.remoteCompressor);
+    S.remoteCompressor.connect(S.remoteAnalyser);
+    S.remoteAnalyser.connect(S.remoteGate);
+    S.remoteGate.connect(S.remoteGain);
+    updateVoiceCleaning();
+    startAudioMeter();
+    $("remoteVideo").muted = true;
+    $("audioState").textContent = "Androidマイク受信中（Web音声フィルター）";
+    if (S.audioContext.state === "suspended") {
+      S.audioContext.resume().catch(error => console.debug("Android audio resume failed", error));
+    }
+  } catch (error) {
+    console.warn("Remote audio routing failed; falling back to media element", error);
+    stopAudioMeter();
+    $("remoteVideo").muted = false;
+    $("audioState").textContent = "Androidマイク受信中（標準音声へ切替）";
+  }
+}
+
+function updateVoiceCleaning() {
+  const level = Math.max(0, Math.min(100, Number(S.voiceCleanLevel) || 0));
+  $("voiceCleanValue").textContent = level + "%";
+  $("voiceClean").value = String(level);
+  if (!S.audioContext) return;
+  const now = S.audioContext.currentTime;
+  if (S.remoteHighpass && S.remoteLowpass && S.remoteCompressor && S.remoteGate) {
+    const amount = level / 100;
+    S.remoteHighpass.frequency.setTargetAtTime(20 + amount * 95, now, 0.025);
+    S.remoteLowpass.frequency.setTargetAtTime(20000 - amount * 12500, now, 0.025);
+    S.remoteCompressor.threshold.setTargetAtTime(amount === 0 ? 0 : -18 - amount * 14, now, 0.03);
+    S.remoteCompressor.ratio.setTargetAtTime(amount === 0 ? 1 : 2 + amount * 6, now, 0.03);
+    S.remoteCompressor.knee.setTargetAtTime(amount === 0 ? 0 : 16, now, 0.03);
+    S.remoteGateTarget = 1;
+    S.remoteGate.gain.setTargetAtTime(1, now, 0.03);
+  }
+}
+
+function startAudioMeter() {
+  if (!S.remoteAnalyser || S.audioMeterFrame !== null) return;
+  const data = new Uint8Array(S.remoteAnalyser.fftSize);
+  let gateUpdateCount = 0;
+  const tick = () => {
+    if (!S.remoteAnalyser) { S.audioMeterFrame = null; return; }
+    S.remoteAnalyser.getByteTimeDomainData(data);
+    let sum = 0;
+    for (const value of data) { const sample = (value - 128) / 128; sum += sample * sample; }
+    const rms = Math.sqrt(sum / data.length);
+    $("audioLevel").value = Math.min(1, rms * 3);
+    $("audioLevelText").textContent = rms < 0.008 ? "静か" : rms < 0.04 ? "小さい音" : rms < 0.16 ? "音声受信中" : "大きな音";
+    gateUpdateCount++;
+    if (S.remoteGate && S.audioContext && S.voiceCleanLevel > 0 && gateUpdateCount % 4 === 0) {
+      const amount = S.voiceCleanLevel / 100;
+      const threshold = 0.0008 + amount * 0.0045;
+      const target = rms < threshold ? 1 - amount * 0.65 : 1;
+      if (Math.abs(target - S.remoteGateTarget) > 0.06) {
+        S.remoteGateTarget = target;
+        S.remoteGate.gain.setTargetAtTime(target, S.audioContext.currentTime, target < 1 ? 0.12 : 0.045);
+      }
+    } else if (S.remoteGate && S.audioContext && S.voiceCleanLevel === 0 && S.remoteGateTarget !== 1) {
+      S.remoteGateTarget = 1;
+      S.remoteGate.gain.setTargetAtTime(1, S.audioContext.currentTime, 0.04);
+    }
+    S.audioMeterFrame = requestAnimationFrame(tick);
+  };
+  S.audioMeterFrame = requestAnimationFrame(tick);
+}
+function stopAudioMeter() {
+  if (S.audioMeterFrame !== null) cancelAnimationFrame(S.audioMeterFrame);
+  S.audioMeterFrame = null;
+  [S.remoteAnalyser, S.remoteHighpass, S.remoteLowpass, S.remoteCompressor, S.remoteGate].forEach(node => {
+    if (node) { try { node.disconnect(); } catch (_) {} }
+  });
+  S.remoteAnalyser = null;
+  S.remoteHighpass = null;
+  S.remoteLowpass = null;
+  S.remoteCompressor = null;
+  S.remoteGate = null;
+  S.remoteGateTarget = 1;
+  $("audioLevel").value = 0;
+  $("audioLevelText").textContent = "待機中";
+}
+
+function handleControlMessage(raw) {
+  let data;
+  try { data = typeof raw === "string" ? JSON.parse(raw) : raw; }
+  catch (error) { console.debug("Invalid control-channel response", error); return; }
+  if (!data || typeof data !== "object") return;
+  if (data.type === "device_status") {
+    const battery = Number(data.batteryPercent);
+    const batteryText = Number.isFinite(battery) && battery >= 0 ? battery + "%" : "取得不可";
+    const temperature = Number(data.batteryTempC);
+    const tempText = Number.isFinite(temperature) ? " / " + temperature.toFixed(1) + "℃" : "";
+    $("androidStatus").textContent =
+      "Android電池 " + batteryText + (data.charging ? "・充電中" : "") + tempText +
+      " / " + (data.cameraFacing === "front" ? "前面カメラ" : "背面カメラ") +
+      " / ライト " + (data.flashlightOn ? "ON" : "OFF");
+    S.flashlightOn = !!data.flashlightOn;
+    S.flashlightAvailable = !!data.flashlightAvailable;
+    S.monitorStartedAt = Number(data.monitorStartedAt) || 0;
+    S.monitorElapsedMs = Number(data.monitorElapsedMs) || 0;
+    S.monitorRxBytes = Number(data.monitorRxBytes);
+    S.monitorTxBytes = Number(data.monitorTxBytes);
+    if (!Number.isFinite(S.monitorRxBytes)) S.monitorRxBytes = -1;
+    if (!Number.isFinite(S.monitorTxBytes)) S.monitorTxBytes = -1;
+    updateMonitorInfo();
+    if (S.monitorStartedAt && !S.monitorClockTimer) {
+      S.monitorClockTimer = setInterval(updateMonitorInfo, 1000);
+    }
+    if (!S.monitorStartedAt && S.monitorClockTimer) {
+      clearInterval(S.monitorClockTimer);
+      S.monitorClockTimer = null;
+    }
+    S.flashlightPending = false;
+    updateFlashlightButton(S.flashlightAvailable, S.flashlightOn);
+    return;
+  }
+  if (data.type === "command_result" && data.name === "flashlight") {
+    S.flashlightPending = false;
+    if (data.success) {
+      if (data.payload && typeof data.payload.enabled === "boolean") {
+        S.flashlightOn = data.payload.enabled;
+      } else if (typeof data.flashlightOn === "boolean") {
+        S.flashlightOn = data.flashlightOn;
+      }
+      updateFlashlightButton(S.flashlightAvailable, S.flashlightOn);
+      toast(S.flashlightOn ? "AndroidライトをONにしました。" : "AndroidライトをOFFにしました。");
+      window.setTimeout(() => requestDeviceStatus().catch(() => {}), 350);
+    } else {
+      updateFlashlightButton(S.flashlightAvailable, S.flashlightOn);
+      toast("ライトを切り替えできませんでした。端末のカメラ使用状態を確認してください。");
+    }
+  }
+}
+
+function updateFlashlightButton(available, enabled) {
+  const button = $("flashlight");
+  button.disabled = !S.pc || !available || S.flashlightPending;
+  button.classList.toggle("active", enabled);
+  button.classList.toggle("pending", S.flashlightPending);
+  button.textContent = S.flashlightPending ? "🔦 切替中…" : enabled ? "🔦 ライト ON" : "🔦 ライト OFF";
+  button.title = available ? "Android背面カメラのライトを切り替えます" : "この端末ではライトを利用できません";
+}
+
+async function requestDeviceStatus() {
+  if (!S.controlChannel || S.controlChannel.readyState !== "open") {
+    throw new Error("端末情報の取得にはWebRTC接続が必要です。");
+  }
+  S.controlChannel.send(JSON.stringify({
+    type: "command", name: "get_device_status", payload: {}, requestId: rid(), sentAt: Date.now()
+  }));
+}
+
+function openImageViewer(source, filename, title, ownsObjectUrl = false) {
+  if (!source) return toast("表示できる画像がありません。");
+  releaseImageViewerSource();
+  S.imageViewerSource = source;
+  S.imageViewerFilename = filename || "remote-camera-image.jpg";
+  S.imageObjectUrl = ownsObjectUrl && String(source).startsWith("blob:") ? source : "";
+  $("imageViewerImage").src = source;
+  $("imageViewerImage").alt = title || "受信画像";
+  $("imageViewerTitle").textContent = title || "受信画像";
+  $("imageViewerDownload").disabled = false;
+  const dialog = $("imageViewerDialog");
+  if (!dialog.open) dialog.showModal();
+  notifyBookmarkletPanel("expand-image");
+}
+function releaseImageViewerSource() {
+  $("imageViewerImage").removeAttribute("src");
+  if (S.imageObjectUrl) {
+    try { URL.revokeObjectURL(S.imageObjectUrl); } catch (_) {}
+  }
+  S.imageViewerSource = "";
+  S.imageViewerFilename = "";
+  S.imageObjectUrl = "";
+}
+function saveImageViewer() {
+  if (!S.imageViewerSource) return toast("保存する画像がありません。");
+  const anchor = document.createElement("a");
+  anchor.href = S.imageViewerSource;
+  anchor.download = S.imageViewerFilename || "remote-camera-image.jpg";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  toast("画像の保存を開始しました。");
+}
+async function toggleImageFullscreen() {
+  const dialog = $("imageViewerDialog");
+  try {
+    if (document.fullscreenElement === dialog) {
+      await document.exitFullscreen();
+    } else if (dialog.requestFullscreen) {
+      await dialog.requestFullscreen();
+    } else {
+      toast("このブラウザーでは画像ビューアーが画面いっぱいに表示されています。");
+    }
+  } catch (error) {
+    toast("全画面表示を切り替えできませんでした: " + error.message);
+  }
+}
+async function takeSnapshot() {
+  const video = $("remoteVideo");
+  if (!S.pc || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+    return toast("保存できる映像がまだありません。");
+  }
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) throw new Error("画像処理を開始できません。");
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", 0.92));
+    if (!blob) throw new Error("画像データを作成できませんでした。");
+    const url = URL.createObjectURL(blob);
+    const filename = "remote-camera-" + new Date().toISOString().replace(/[:.]/g, "-") + ".jpg";
+    openImageViewer(url, filename, "受信画像", true);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    toast("受信画像を全画面表示しました。保存ボタンからも保存できます。");
+  } catch (error) {
+    toast("静止画を作成できません: " + error.message);
+  }
+}
+
+async function toggleFlashlight() {
+  if (!S.pc) return toast("先にAndroidへ接続してください。");
+  if (S.flashlightPending) return;
+  S.flashlightPending = true;
+  updateFlashlightButton(S.flashlightAvailable, S.flashlightOn);
+  const next = !S.flashlightOn;
+  try {
+    if (S.controlChannel && S.controlChannel.readyState === "connecting") {
+      await new Promise(resolve => {
+        const channel = S.controlChannel;
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        channel.addEventListener("open", finish, { once: true });
+        window.setTimeout(finish, 700);
+      });
+    }
+    const result = await sendControlCommand("flashlight", { enabled: next });
+    const deadline = Date.now() + (result.delivered === "webrtc" ? 2200 : 4200);
+    while (S.flashlightPending && Date.now() < deadline) {
+      await new Promise(resolve => window.setTimeout(resolve, 80));
+    }
+    if (S.flashlightPending && S.controlChannel && S.controlChannel.readyState === "open") {
+      await requestDeviceStatus().catch(() => {});
+      const statusDeadline = Date.now() + 900;
+      while (S.flashlightPending && Date.now() < statusDeadline) {
+        await new Promise(resolve => window.setTimeout(resolve, 80));
+      }
+    }
+    if (S.flashlightPending) {
+      S.flashlightPending = false;
+      updateFlashlightButton(S.flashlightAvailable, S.flashlightOn);
+      toast("Androidからライト状態の応答がありません。通信状態を確認して再度押してください。");
+    }
+  } catch (error) {
+    S.flashlightPending = false;
+    updateFlashlightButton(S.flashlightAvailable, S.flashlightOn);
+    toast("ライト操作に失敗しました：" + error.message);
+  }
+}
+
+async function enableScreenWakeLock() {
+  if (!navigator.wakeLock || typeof navigator.wakeLock.request !== "function") {
+    toast("このブラウザーは画面スリープ防止に対応していません。");
+    return false;
+  }
+  try {
+    S.wakeLock = await navigator.wakeLock.request("screen");
+    S.wakeLock.addEventListener("release", () => {
+      S.wakeLock = null;
+      $("keepAwake").classList.remove("active");
+      $("keepAwake").textContent = "画面スリープ防止 OFF";
+    });
+    $("keepAwake").classList.add("active");
+    $("keepAwake").textContent = "画面スリープ防止 ON";
+    return true;
+  } catch (error) {
+    S.wakeLock = null;
+    toast("画面スリープ防止を開始できません：" + error.message);
+    return false;
+  }
+}
+
+async function toggleScreenWakeLock() {
+  S.keepAwakeWanted = !S.keepAwakeWanted;
+  if (!S.keepAwakeWanted) {
+    if (S.wakeLock) {
+      try { await S.wakeLock.release(); } catch (_) {}
+      S.wakeLock = null;
+    }
+    $("keepAwake").classList.remove("active");
+    $("keepAwake").textContent = "画面スリープ防止 OFF";
+    return;
+  }
+  const ok = await enableScreenWakeLock();
+  if (!ok) S.keepAwakeWanted = false;
+}
+
+function updateAdaptiveQuality(loss, fps, rttMs) {
+  if (!S.pc || $("dataMode").value !== "auto") return;
+  const modes = ["ultra", "save", "standard", "high"];
+  const currentIndex = Math.max(0, modes.indexOf(S.appliedAdaptiveMode));
+  const now = Date.now();
+  let nextIndex = currentIndex;
+  const severe = loss > 8 || fps < 9 || (rttMs !== null && rttMs > 500);
+  const warning = loss > 4 || fps < 15 || (rttMs !== null && rttMs > 320);
+  if (severe) {
+    nextIndex = Math.max(0, currentIndex - 1);
+    S.adaptiveStableSince = 0;
+  } else if (warning) {
+    nextIndex = Math.max(0, currentIndex - 1);
+    S.adaptiveStableSince = 0;
+  } else {
+    if (!S.adaptiveStableSince) S.adaptiveStableSince = now;
+    if (now - S.adaptiveStableSince > 35000) nextIndex = Math.min(modes.length - 1, currentIndex + 1);
+  }
+  if (nextIndex === currentIndex || now - S.adaptiveLastChangeAt < 12000) return;
+  if (!S.controlChannel || S.controlChannel.readyState !== "open") return;
+  S.appliedAdaptiveMode = modes[nextIndex];
+  S.adaptiveLastChangeAt = now;
+  sendControlCommand("quality", {
+    quality: $("quality").value,
+    dataMode: S.appliedAdaptiveMode,
+    captureRatio: $("captureRatio").value,
+    fpsLimit: Number($("fpsLimit").value)
+  }).then(() => {
+    $("connectionMetrics").textContent += " / 自動画質：" + S.appliedAdaptiveMode;
+  }).catch(error => console.debug("Adaptive quality command failed", error));
+}
+
+function setReceiveVolume(value, persist = true) {
+  S.receiveVolume = Math.max(0, Math.min(200, Number(value) || 0));
+  $("volume").value = String(S.receiveVolume);
+  $("volumeValue").textContent = S.receiveVolume + "%";
+  if (S.remoteGain && S.audioContext) {
+    S.remoteGain.gain.setTargetAtTime(S.receiveVolume / 100, S.audioContext.currentTime, 0.035);
+  } else if ($("remoteVideo")) {
+    try { $("remoteVideo").volume = Math.min(100, S.receiveVolume) / 100; } catch (_) {}
+  }
+  if (persist) {
+    try { localStorage.setItem(storageKey("rc_receive_volume_v1"), String(S.receiveVolume)); } catch (_) {}
+  }
+}
+
+function stopVideoWatchdog() {
+  if (S.videoWatchdogTimer) clearInterval(S.videoWatchdogTimer);
+  S.videoWatchdogTimer = null;
+  if (S.videoFrameCallbackId !== null && $("remoteVideo").cancelVideoFrameCallback) {
+    try { $("remoteVideo").cancelVideoFrameCallback(S.videoFrameCallbackId); } catch (_) {}
+  }
+  S.videoFrameCallbackId = null;
+  S.videoUsesFrameCallback = false;
+  S.lastVideoFrameAt = 0;
+  S.hasReceivedVideoFrame = false;
+}
+
+function startVideoWatchdog(pc) {
+  if (S.pc === pc && S.videoWatchdogTimer) return;
+  stopVideoWatchdog();
+  $("videoState").textContent = "映像の初回フレーム待ち";
+  S.hasReceivedVideoFrame = false;
+  S.lastVideoFrameAt = 0;
+  const video = $("remoteVideo");
+  const onFrame = () => {
+    if (S.pc !== pc) return;
+    S.hasReceivedVideoFrame = true;
+    S.lastVideoFrameAt = Date.now();
+    $("videoState").textContent = "映像受信中";
+    if (typeof video.requestVideoFrameCallback === "function") {
+      S.videoUsesFrameCallback = true;
+      S.videoFrameCallbackId = video.requestVideoFrameCallback(onFrame);
+    }
+  };
+  if (typeof video.requestVideoFrameCallback === "function") {
+    S.videoUsesFrameCallback = true;
+    S.videoFrameCallbackId = video.requestVideoFrameCallback(onFrame);
+  }
+  S.videoWatchdogTimer = setInterval(() => {
+    if (S.pc !== pc || pc.connectionState !== "connected") return;
+    const now = Date.now();
+    if (!S.hasReceivedVideoFrame) {
+      const connectedFor = S.connectedAt ? now - S.connectedAt : 0;
+      if (connectedFor > 15000) {
+        $("videoState").textContent = "映像未着信・再接続中";
+        toast("通信は接続中ですが映像が届きません。映像接続を再構築します。");
+        scheduleReconnect(pc, true, 1200);
+      }
+    } else if (now - S.lastVideoFrameAt > 8000) {
+      $("videoState").textContent = "映像フリーズ・再接続中";
+      toast("映像フレームが8秒以上停止しました。接続を再構築します。");
+      scheduleReconnect(pc, true, 1200);
+    }
+  }, 2000);
+}
+
+const MOTION_STORAGE_KEY = "rc_motion_events_v451";
+const LEGACY_MOTION_STORAGE_KEY = "rc_motion_events_v42";
+const MOTION_ZONES_KEY = "rc_motion_zones_v451";
+const MOTION_WIDTH = 160;
+const MOTION_HEIGHT = 90;
+const MAX_MOTION_ZONES = 8;
+const MAX_MOTION_EVENTS = 20;
+
+function clamp01(value) { return Math.max(0, Math.min(1, Number(value) || 0)); }
+function safeMotionZone(zone, index) {
+  if (!zone || typeof zone !== "object") return null;
+  const x = clamp01(zone.x), y = clamp01(zone.y);
+  const w = Math.max(0, Math.min(1 - x, Number(zone.w) || 0));
+  const h = Math.max(0, Math.min(1 - y, Number(zone.h) || 0));
+  if (w < 0.015 || h < 0.015) return null;
+  return {
+    id: String(zone.id || ("zone-" + index)).slice(0, 48),
+    name: String(zone.name || ("範囲" + (index + 1))).replace(/[<>]/g, "").slice(0, 24),
+    x, y, w, h,
+    enabled: zone.enabled !== false,
+    sensitivity: ["low", "normal", "high"].includes(zone.sensitivity) ? zone.sensitivity : "normal"
+  };
+}
+function readMotionZones() {
+  const stored = storageGet(MOTION_ZONES_KEY, null);
+  if (stored === null) return [{
+    id: "full-screen", name: "全画面", x: 0, y: 0, w: 1, h: 1,
+    enabled: true, sensitivity: "normal"
+  }];
+  try {
+    const parsed = JSON.parse(stored);
+    if (!Array.isArray(parsed)) throw new Error("invalid zone storage");
+    return parsed.slice(0, MAX_MOTION_ZONES).map(safeMotionZone).filter(Boolean);
+  } catch (_) {
+    return [{
+      id: "full-screen", name: "全画面", x: 0, y: 0, w: 1, h: 1,
+      enabled: true, sensitivity: "normal"
+    }];
+  }
+}
+function saveMotionZones() {
+  return storageSet(MOTION_ZONES_KEY, JSON.stringify(S.motionZones.slice(0, MAX_MOTION_ZONES)));
+}
+function readMotionEvents() {
+  try {
+    const stored = storageGet(MOTION_STORAGE_KEY, null);
+    const value = JSON.parse(stored === null ? storageGet(LEGACY_MOTION_STORAGE_KEY, "[]") : stored);
+    if (!Array.isArray(value)) return [];
+    return value.filter(event => event && typeof event.timestamp === "string" &&
+      Number.isFinite(Date.parse(event.timestamp)) && Number.isFinite(Number(event.ratio)))
+      .slice(0, MAX_MOTION_EVENTS).map(event => ({
+        ...event,
+        kind: typeof event.kind === "string" ? event.kind : "motion",
+        zoneName: typeof event.zoneName === "string" ? event.zoneName : "全画面",
+        personCount: Math.max(0, Number(event.personCount) || 0),
+        direction: typeof event.direction === "string" ? event.direction : "",
+        image: typeof event.image === "string" && event.image.startsWith("data:image/jpeg;base64,") &&
+          event.image.length <= 150000 ? event.image : ""
+      }));
+  } catch (_) { return []; }
+}
+function saveMotionEvents() {
+  if (storageSet(MOTION_STORAGE_KEY, JSON.stringify(S.motionEvents.slice(0, MAX_MOTION_EVENTS)))) return;
+  S.motionEvents = S.motionEvents.slice(0, MAX_MOTION_EVENTS).map(event => ({ ...event, image: "" }));
+  storageSet(MOTION_STORAGE_KEY, JSON.stringify(S.motionEvents));
+}
+function selectedMotionZone() {
+  return S.motionZones.find(zone => zone.id === S.motionSelectedZoneId) || null;
+}
+function renderMotionZones() {
+  const host = $("motionZoneList");
+  if (!host) return;
+  host.replaceChildren();
+  if (!S.motionZones.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "検知範囲がありません。「映像上で検知範囲を追加」を押してください。";
+    host.appendChild(empty);
+  }
+  S.motionZones.forEach(zone => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "motionZoneItem" + (zone.id === S.motionSelectedZoneId ? " selected" : "");
+    button.setAttribute("aria-pressed", zone.id === S.motionSelectedZoneId ? "true" : "false");
+    const name = document.createElement("b");
+    name.textContent = zone.name;
+    const detail = document.createElement("small");
+    detail.textContent = (zone.enabled ? "有効" : "停止中") + " · 感度 " +
+      ({low:"低",normal:"標準",high:"高"}[zone.sensitivity] || "標準") +
+      " · " + Math.round(zone.w * 100) + "×" + Math.round(zone.h * 100) + "%";
+    button.append(name, detail);
+    button.addEventListener("click", () => selectMotionZone(zone.id));
+    host.appendChild(button);
+  });
+  updateMotionZoneEditor();
+  drawMotionOverlay();
+}
+function updateMotionZoneEditor() {
+  const zone = selectedMotionZone();
+  $("motionZoneName").disabled = !zone;
+  $("motionZoneSensitivity").disabled = !zone;
+  $("motionZoneEnabled").disabled = !zone;
+  $("saveMotionZone").disabled = !zone;
+  $("deleteMotionZone").disabled = !zone;
+  if (!zone) {
+    $("motionZoneName").value = "";
+    $("motionZoneSensitivity").value = "normal";
+    $("motionZoneEnabled").checked = false;
+    return;
+  }
+  $("motionZoneName").value = zone.name;
+  $("motionZoneSensitivity").value = zone.sensitivity;
+  $("motionZoneEnabled").checked = zone.enabled;
+}
+function selectMotionZone(id) {
+  S.motionSelectedZoneId = id;
+  renderMotionZones();
+}
+function saveSelectedMotionZone() {
+  const zone = selectedMotionZone();
+  if (!zone) return;
+  const name = $("motionZoneName").value.trim().replace(/[<>]/g, "").slice(0, 24);
+  zone.name = name || "範囲";
+  zone.sensitivity = ["low", "normal", "high"].includes($("motionZoneSensitivity").value)
+    ? $("motionZoneSensitivity").value : "normal";
+  zone.enabled = $("motionZoneEnabled").checked;
+  saveMotionZones();
+  renderMotionZones();
+  toast("検知範囲の設定を保存しました。");
+}
+function deleteSelectedMotionZone() {
+  const zone = selectedMotionZone();
+  if (!zone) return;
+  S.motionZones = S.motionZones.filter(item => item.id !== zone.id);
+  S.motionSelectedZoneId = S.motionZones[0]?.id || "";
+  saveMotionZones();
+  S.personZoneStates = {};
+  renderMotionZones();
+  toast("検知範囲を削除しました。");
+}
+function setMotionDrawingMode(enabled) {
+  S.motionDrawingEnabled = !!enabled;
+  const overlay = $("motionOverlay");
+  overlay.classList.toggle("is-editing", S.motionDrawingEnabled);
+  $("cancelMotionZone").disabled = !S.motionDrawingEnabled;
+  $("addMotionZone").textContent = S.motionDrawingEnabled ? "映像上をドラッグして範囲指定中…" : "映像上で検知範囲を追加";
+  $("motionOverlayHint").classList.toggle("hidden", !S.motionDrawingEnabled);
+  if (!enabled) S.motionDraft = null;
+  drawMotionOverlay();
+}
+function beginMotionZoneDrawing() {
+  if (!S.pc || S.pc.connectionState !== "connected") {
+    toast("検知範囲を作るにはAndroidの映像へ接続してください。");
+    return;
+  }
+  const video = $("remoteVideo");
+  if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+    toast("映像が届いてから検知範囲を指定してください。");
+    return;
+  }
+  if (S.motionZones.length >= MAX_MOTION_ZONES) {
+    toast("検知範囲は最大" + MAX_MOTION_ZONES + "個です。不要な範囲を削除してください。");
+    return;
+  }
+  showVideo();
+  updateMotionOverlayLayout();
+  setMotionDrawingMode(true);
+  $("motionOverlayHint").textContent = "映像上をドラッグして検知範囲を指定";
+}
+function motionOverlayPoint(event) {
+  const rect = $("motionOverlay").getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  // getBoundingClientRect includes the CSS zoom transform. Undo that transform
+  // so drawn regions still match the source video at 100–250% viewer zoom.
+  const zoom = Math.max(0.25, Number(S.zoom) || 1);
+  const centerX = rect.left + rect.width / 2;
+  const centerY = rect.top + rect.height / 2;
+  return {
+    x: clamp01((event.clientX - centerX) / (rect.width / zoom) + 0.5),
+    y: clamp01((event.clientY - centerY) / (rect.height / zoom) + 0.5)
+  };
+}
+function handleMotionPointerDown(event) {
+  if (!S.motionDrawingEnabled || event.button !== 0) return;
+  const point = motionOverlayPoint(event);
+  if (!point) return;
+  event.preventDefault();
+  S.motionDraft = { x: point.x, y: point.y, x2: point.x, y2: point.y };
+  try { $("motionOverlay").setPointerCapture(event.pointerId); } catch (_) {}
+  drawMotionOverlay();
+}
+function handleMotionPointerMove(event) {
+  if (!S.motionDrawingEnabled || !S.motionDraft) return;
+  const point = motionOverlayPoint(event);
+  if (!point) return;
+  S.motionDraft.x2 = point.x; S.motionDraft.y2 = point.y;
+  drawMotionOverlay();
+}
+function handleMotionPointerUp(event) {
+  if (!S.motionDrawingEnabled || !S.motionDraft) return;
+  const point = motionOverlayPoint(event);
+  if (point) { S.motionDraft.x2 = point.x; S.motionDraft.y2 = point.y; }
+  const draft = S.motionDraft;
+  const x = Math.min(draft.x, draft.x2), y = Math.min(draft.y, draft.y2);
+  const w = Math.abs(draft.x2 - draft.x), h = Math.abs(draft.y2 - draft.y);
+  if (w < 0.02 || h < 0.02) {
+    setMotionDrawingMode(false);
+    toast("範囲が小さすぎます。もう一度ドラッグしてください。");
+    return;
+  }
+  // The default full-screen zone is a fallback only. Replace it as soon as
+  // the user draws the first explicit area, otherwise it would keep detecting everywhere.
+  if (S.motionZones.length === 1 && S.motionZones[0].id === "full-screen") {
+    S.motionZones = [];
+  }
+  const zone = {
+    id: "zone-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 7),
+    name: "範囲" + (S.motionZones.length + 1), x, y, w, h, enabled: true, sensitivity: "normal"
+  };
+  S.motionZones.push(zone);
+  S.motionSelectedZoneId = zone.id;
+  saveMotionZones();
+  setMotionDrawingMode(false);
+  renderMotionZones();
+  $("motionEnabled").checked = true;
+  storageSet("rc_motion_enabled_v42", "1");
+  if (S.pc && !S.motionTimer && !document.hidden) startMotionDetection();
+  toast("検知範囲「" + zone.name + "」を追加しました。");
+}
+function updateMotionOverlayLayout() {
+  const canvas = $("motionOverlay"), pane = $("videoPane"), video = $("remoteVideo");
+  if (!canvas || !pane || !video) return;
+  const paneWidth = pane.clientWidth, paneHeight = pane.clientHeight;
+  if (!paneWidth || !paneHeight) return;
+  const videoWidth = video.videoWidth || paneWidth, videoHeight = video.videoHeight || paneHeight;
+  const fit = S.fitMode === "cover" ? "cover" : "contain";
+  const scale = fit === "cover" ? Math.max(paneWidth / videoWidth, paneHeight / videoHeight)
+    : Math.min(paneWidth / videoWidth, paneHeight / videoHeight);
+  const displayWidth = videoWidth * scale, displayHeight = videoHeight * scale;
+  canvas.style.left = ((paneWidth - displayWidth) / 2) + "px";
+  canvas.style.top = ((paneHeight - displayHeight) / 2) + "px";
+  canvas.style.width = displayWidth + "px";
+  canvas.style.height = displayHeight + "px";
+  canvas.style.transform = "scale(" + S.zoom + ")";
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const width = Math.max(1, Math.round(displayWidth * dpr));
+  const height = Math.max(1, Math.round(displayHeight * dpr));
+  if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+  drawMotionOverlay();
+}
+function drawMotionOverlay() {
+  const canvas = $("motionOverlay");
+  if (!canvas || !canvas.width || !canvas.height) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const colors = ["#4f8fe8", "#36a6b5", "#8a78d6", "#d59b42", "#5aa784"];
+  S.motionZones.forEach((zone, index) => {
+    const x = zone.x * canvas.width, y = zone.y * canvas.height;
+    const w = zone.w * canvas.width, h = zone.h * canvas.height;
+    const color = colors[index % colors.length];
+    ctx.save();
+    ctx.globalAlpha = zone.enabled ? 1 : 0.42;
+    ctx.fillStyle = color; ctx.globalAlpha *= 0.12; ctx.fillRect(x, y, w, h);
+    ctx.globalAlpha = zone.id === S.motionSelectedZoneId ? 1 : 0.78;
+    ctx.lineWidth = Math.max(2, canvas.width / 550);
+    ctx.setLineDash(zone.enabled ? [] : [8, 6]);
+    ctx.strokeStyle = color; ctx.strokeRect(x, y, w, h); ctx.setLineDash([]);
+    const label = zone.name + (zone.enabled ? "" : "（停止）");
+    ctx.font = "600 " + Math.max(11, canvas.width / 70) + "px sans-serif";
+    const labelWidth = Math.min(w, ctx.measureText(label).width + 14);
+    ctx.globalAlpha = 0.94; ctx.fillStyle = "#ffffff";
+    ctx.fillRect(x, y, labelWidth, Math.max(22, canvas.width / 32));
+    ctx.fillStyle = color; ctx.fillText(label, x + 7, y + Math.max(15, canvas.width / 45));
+    ctx.restore();
+  });
+  if (S.motionDraft) {
+    const d = S.motionDraft;
+    const x = Math.min(d.x, d.x2) * canvas.width, y = Math.min(d.y, d.y2) * canvas.height;
+    const w = Math.abs(d.x2 - d.x) * canvas.width, h = Math.abs(d.y2 - d.y) * canvas.height;
+    ctx.save(); ctx.fillStyle = "rgba(61,132,220,0.15)"; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = "#2865d6"; ctx.lineWidth = Math.max(2, canvas.width / 500);
+    ctx.setLineDash([8, 5]); ctx.strokeRect(x, y, w, h); ctx.restore();
+  }
+}
+function motionZoneBounds(zone) {
+  return {
+    x0: Math.max(0, Math.min(MOTION_WIDTH - 1, Math.floor(zone.x * MOTION_WIDTH))),
+    y0: Math.max(0, Math.min(MOTION_HEIGHT - 1, Math.floor(zone.y * MOTION_HEIGHT))),
+    x1: Math.max(1, Math.min(MOTION_WIDTH, Math.ceil((zone.x + zone.w) * MOTION_WIDTH))),
+    y1: Math.max(1, Math.min(MOTION_HEIGHT, Math.ceil((zone.y + zone.h) * MOTION_HEIGHT)))
+  };
+}
+function findPersonCandidates(mask, bounds) {
+  const visited = new Uint8Array(mask.length), expanded = new Uint8Array(mask.length);
+  for (let y = bounds.y0; y < bounds.y1; y++) for (let x = bounds.x0; x < bounds.x1; x++) {
+    if (!mask[y * MOTION_WIDTH + x]) continue;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if (nx >= bounds.x0 && nx < bounds.x1 && ny >= bounds.y0 && ny < bounds.y1)
+        expanded[ny * MOTION_WIDTH + nx] = 1;
+    }
+  }
+  const found = [];
+  for (let y = bounds.y0; y < bounds.y1; y++) for (let x = bounds.x0; x < bounds.x1; x++) {
+    const first = y * MOTION_WIDTH + x;
+    if (!expanded[first] || visited[first]) continue;
+    const stack = [first]; visited[first] = 1;
+    let area = 0, minX = x, maxX = x, minY = y, maxY = y;
+    while (stack.length) {
+      const index = stack.pop(), cx = index % MOTION_WIDTH, cy = Math.floor(index / MOTION_WIDTH);
+      area++; minX = Math.min(minX, cx); maxX = Math.max(maxX, cx);
+      minY = Math.min(minY, cy); maxY = Math.max(maxY, cy);
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < bounds.x0 || nx >= bounds.x1 || ny < bounds.y0 || ny >= bounds.y1) continue;
+        const next = ny * MOTION_WIDTH + nx;
+        if (expanded[next] && !visited[next]) { visited[next] = 1; stack.push(next); }
+      }
+    }
+    const width = maxX - minX + 1, height = maxY - minY + 1;
+    // Correct the temporary 160x90 analysis resize so upright-body ratios also work on portrait video.
+    const aspect = (height / Math.max(1, width)) * sourceAspect * (MOTION_WIDTH / MOTION_HEIGHT);
+    const fill = area / Math.max(1, width * height);
+    if (area >= 12 && height >= 10 && width >= 3 && aspect >= 1.15 && aspect <= 5.8 &&
+        fill >= 0.035 && width * height < MOTION_WIDTH * MOTION_HEIGHT * 0.32) {
+      found.push({ x:(minX+maxX)/2/MOTION_WIDTH, y:(minY+maxY)/2/MOTION_HEIGHT,width,height,area });
+    }
+  }
+  return found.sort((a,b)=>b.area-a.area).slice(0,8);
+}
+function movementDirection(previous, current) {
+  if (!previous || !current) return "方向未判定";
+  const dx=current.x-previous.x, dy=current.y-previous.y;
+  if (Math.max(Math.abs(dx),Math.abs(dy))<0.015) return "ほぼ同じ位置";
+  if (Math.abs(dx)>Math.abs(dy)*1.25) return dx>0?"右方向":"左方向";
+  return dy>0?"下方向":"上方向";
+}
+function motionEventLabel(event) {
+  if (event.kind==="person-entry") return "人物候補の進入";
+  if (event.kind==="person-exit") return "人物候補の退出";
+  if (event.kind==="person-motion") return "人物らしい動きを検知";
+  return "動体を検知";
+}
+function showMotionNotification(event) {
+  if (!("Notification" in window) || Notification.permission!=="granted") return;
+  const title="Remote Camera： "+motionEventLabel(event);
+  const body=event.zoneName+" / "+new Date(event.timestamp).toLocaleTimeString()+
+    (event.personCount>0?" / 人物候補 約"+event.personCount+"個":"");
+  const options={body,icon:"./icon-192.svg",tag:"rc-motion-"+event.zoneId+"-"+event.kind+"-"+Date.now()};
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.getRegistration("./").then(reg=>{
+      if (reg && reg.showNotification) return reg.showNotification(title,options);
+      new Notification(title,options); return null;
+    }).catch(()=>{try{new Notification(title,options);}catch(_){}});
+  } else { try{new Notification(title,options);}catch(_){} }
+}
+function recordMotionEvent(ratio, zone, kind, personCount=0, direction="") {
+  const event={
+    timestamp:new Date().toISOString(), ratio:Number(ratio)||0,
+    sensitivity:zone.sensitivity||$("motionSensitivity").value,
+    zoneId:zone.id, zoneName:zone.name, kind:kind||"motion",
+    personCount:Math.max(0,Number(personCount)||0), direction:direction||"", image:""
+  };
+  try {
+    const video=$("remoteVideo");
+    if(video.videoWidth&&video.videoHeight){
+      const image=document.createElement("canvas"),scale=Math.min(1,240/video.videoWidth);
+      image.width=Math.max(1,Math.round(video.videoWidth*scale));
+      image.height=Math.max(1,Math.round(video.videoHeight*scale));
+      const ctx=image.getContext("2d");
+      if(ctx){ctx.drawImage(video,0,0,image.width,image.height);event.image=image.toDataURL("image/jpeg",0.42);}
+    }
+  } catch(error){console.debug("Motion snapshot skipped",error);}
+  S.motionEvents.unshift(event);
+  S.motionEvents=S.motionEvents.slice(0,MAX_MOTION_EVENTS);
+  saveMotionEvents(); S.motionLastTriggered=Date.now();
+  $("motionState").textContent="検知："+zone.name+" · "+new Date(event.timestamp).toLocaleTimeString();
+  showMotionNotification(event);
+  toast(motionEventLabel(event)+"："+zone.name);
+  return event;
+}
+function stopMotionDetection(keepEnabled=true) {
+  if(S.motionTimer) clearInterval(S.motionTimer);
+  S.motionTimer=null; S.motionPrevious=null; S.personZoneStates={};
+  $("personState").textContent="人物候補：未解析";
+  $("motionState").textContent=keepEnabled&&$("motionEnabled").checked
+    ?(document.hidden?"バックグラウンドでは一時停止":"接続待ち・映像受信時に再開")
+    :"動体検知 OFF";
+  drawMotionOverlay();
+}
+function startMotionDetection() {
+  if(S.motionTimer||!S.pc||document.hidden||!$("motionEnabled").checked) return;
+  if(!S.motionZones.some(zone=>zone.enabled)){
+    $("motionState").textContent="有効な検知範囲がありません"; return;
+  }
+  $("motionState").textContent="映像を解析中…";
+  const canvas=document.createElement("canvas");
+  canvas.width=MOTION_WIDTH; canvas.height=MOTION_HEIGHT;
+  const context=canvas.getContext("2d",{willReadFrequently:true});
+  if(!context){$("motionState").textContent="このブラウザーは画像解析に対応していません";return;}
+  S.motionTimer=setInterval(()=>{
+    const video=$("remoteVideo");
+    if(!S.pc||document.hidden||video.readyState<2||!video.videoWidth) return;
+    try{
+      context.drawImage(video,0,0,MOTION_WIDTH,MOTION_HEIGHT);
+      const pixels=context.getImageData(0,0,MOTION_WIDTH,MOTION_HEIGHT).data;
+      if(!S.motionPrevious){S.motionPrevious=new Uint8ClampedArray(pixels);updateMotionOverlayLayout();return;}
+      const pixelCount=MOTION_WIDTH*MOTION_HEIGHT,mask=new Uint8Array(pixelCount);
+      let allChanged=0;
+      for(let p=0,i=0;p<pixelCount;p++,i+=4){
+        const diff=Math.abs(pixels[i]-S.motionPrevious[i])+Math.abs(pixels[i+1]-S.motionPrevious[i+1])+
+          Math.abs(pixels[i+2]-S.motionPrevious[i+2]);
+        if(diff>54){mask[p]=1;allChanged++;}
+      }
+      S.motionPrevious=new Uint8ClampedArray(pixels);
+      const globalRatio=allChanged/pixelCount;
+      let totalPersonCandidates=0;
+      const directionLabels=[];
+      if(globalRatio<0.58){
+        S.motionZones.forEach(zone=>{
+          if(!zone.enabled)return;
+          const bounds=motionZoneBounds(zone),width=Math.max(1,bounds.x1-bounds.x0);
+          const height=Math.max(1,bounds.y1-bounds.y0),area=width*height;
+          let changed=0;
+          for(let y=bounds.y0;y<bounds.y1;y++)for(let x=bounds.x0;x<bounds.x1;x++)
+            if(mask[y*MOTION_WIDTH+x])changed++;
+          const ratio=changed/area;
+          const sensitivity=zone.sensitivity||$("motionSensitivity").value;
+          const threshold=({low:0.16,normal:0.09,high:0.045})[sensitivity]||0.09;
+          const candidates=$("personCandidateEnabled").checked
+            ?findPersonCandidates(mask,bounds,video.videoHeight/Math.max(1,video.videoWidth)):[];
+          totalPersonCandidates+=candidates.length;
+          const state=S.personZoneStates[zone.id]||{
+            present:false,lastSeenAt:0,emptySince:0,lastMotionEventAt:0,centroid:null
+          };
+          const primary=candidates[0]||null;
+          const direction=primary?movementDirection(state.centroid,primary):"";
+          if(primary){
+            directionLabels.push(zone.name+":"+direction);
+            if(!state.present&&$("personEntryEnabled").checked){
+              recordMotionEvent(ratio,zone,"person-entry",candidates.length,direction);
+            }else if(ratio>=threshold&&Date.now()-state.lastMotionEventAt>=10000){
+              recordMotionEvent(ratio,zone,"person-motion",candidates.length,direction);
+            }
+            state.present=true;state.lastSeenAt=Date.now();state.emptySince=0;
+            state.centroid={x:primary.x,y:primary.y};
+          }else if(state.present){
+            if(!state.emptySince)state.emptySince=Date.now();
+            if(Date.now()-state.emptySince>=2300){
+              if($("personExitEnabled").checked)recordMotionEvent(ratio,zone,"person-exit",0,"範囲から消失");
+              state.present=false;state.centroid=null;state.emptySince=0;
+            }
+          }
+          if(!primary&&ratio>=threshold&&Date.now()-state.lastMotionEventAt>=10000)
+            recordMotionEvent(ratio,zone,"motion",0,"");
+          if(ratio>=threshold||primary)state.lastMotionEventAt=Date.now();
+          S.personZoneStates[zone.id]=state;
+        });
+      }
+      $("personState").textContent="人物候補（概算）："+totalPersonCandidates+"個"+
+        (directionLabels.length?" / "+directionLabels.slice(0,2).join("、"):"");
+      $("motionState").textContent=globalRatio>=0.58
+        ?"画面全体の急変を除外中（照明変化など）"
+        :"範囲別解析中 · 人物候補 "+totalPersonCandidates+"個";
+    }catch(error){$("motionState").textContent="解析エラー";console.debug("Motion analysis",error);}
+  },650);
+}
+async function requestMotionNotifications() {
+  if(!("Notification" in window))
+    return toast("このブラウザーでは通知を利用できません。PWAをホーム画面に追加し、対応OSで確認してください。");
+  try{
+    const permission=await Notification.requestPermission();
+    toast(permission==="granted"?"通知を許可しました。PWAが動作中の検知で通知します。":"通知は許可されませんでした。");
+  }catch(_){toast("通知許可を取得できませんでした。");}
+}
+function renderMotionEvents() {
+  const host=$("motionRows");host.replaceChildren();
+  if(!S.motionEvents.length){
+    const empty=document.createElement("p");empty.textContent="検知イベントはありません。";host.appendChild(empty);return;
+  }
+  S.motionEvents.forEach(event=>{
+    const row=document.createElement("div");row.className="motionrow";
+    const detail=document.createElement("span");
+    detail.textContent=new Date(event.timestamp).toLocaleString()+" · "+motionEventLabel(event)+" · "+event.zoneName+
+      (event.personCount?" · 人物候補 約"+event.personCount+"個":"")+
+      (event.direction?" · "+event.direction:"")+" · 画面変化 "+(Number(event.ratio)*100).toFixed(1)+"%";
+    row.appendChild(detail);
+    if(event.image){
+      const filename="remote-camera-motion-"+event.timestamp.replace(/[^0-9T-]/g,"-")+".jpg";
+      const preview=document.createElement("button");preview.type="button";preview.className="motionThumb";
+      preview.setAttribute("aria-label","検知画像を全画面表示");
+      const image=document.createElement("img");image.src=event.image;image.alt="検知時の静止画";image.loading="lazy";
+      const label=document.createElement("span");label.textContent="画像を表示";preview.append(image,label);
+      preview.addEventListener("click",()=>openImageViewer(event.image,filename,
+        motionEventLabel(event)+" · "+new Date(event.timestamp).toLocaleString()));
+      row.appendChild(preview);
+      const link=document.createElement("a");link.href=event.image;link.download=filename;
+      link.textContent="画像を保存";row.appendChild(link);
+    }
+    host.appendChild(row);
+  });
+}
+function showMotionEvents(){renderMotionEvents();$("motionDialog").showModal();}
+function exportMotionEvents() {
+  const rows=[["timestamp","event_type","zone_name","change_ratio","person_count_estimate","direction","sensitivity"]];
+  S.motionEvents.forEach(event=>rows.push([
+    event.timestamp,motionEventLabel(event),event.zoneName,Number(event.ratio).toFixed(4),
+    String(event.personCount||0),event.direction||"",event.sensitivity||""
+  ]));
+  const csv="\uFEFF"+rows.map(row=>row.map(value=>'"'+String(value).replace(/"/g,'""')+'"').join(",")).join("\r\n");
+  const url=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));
+  const link=document.createElement("a");link.href=url;link.download="remote-camera-motion-events-v4.5.1.csv";
+  link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+async function registerPwa() {
+  if(!window.isSecureContext||!("serviceWorker" in navigator)){console.info("PWA service worker is unavailable.");return false;}
+  try{await navigator.serviceWorker.register("./sw.js",{scope:"./"});return true;}
+  catch(error){console.warn("PWA service worker registration failed",error);return false;}
+}
+
+async function connect(automatic = false) {
+  // A direct click handler receives a PointerEvent; only the literal true
+  // value is used for an automatic retry.
+  automatic = automatic === true;
+  if (!S.device) return toast("先にAndroidをペアリングしてください。");
+  if (!automatic) {
+    S.manualDisconnect = false;
+    S.reconnectAttempts = 0;
+  }
+  if (S.reconnectTimer) {
+    clearTimeout(S.reconnectTimer);
+    S.reconnectTimer = null;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return toast("このブラウザではマイクを利用できません。SafariのHTTPS接続を確認してください。");
+  }
+  // Resume/create Web Audio while the Connect button still has user activation on iOS.
+  prepareAudioOutput();
+  if (S.pc) await disconnect(false);
+  try {
+    // Reuse the already-authorized microphone stream across automatic retries.
+    // Re-requesting getUserMedia during a reconnect can be blocked by mobile Safari
+    // when the page no longer has a fresh user gesture.
+    let stream = S.mic;
+    let localAudioTrack = stream && stream.getAudioTracks()
+      .find(track => track.readyState === "live");
+    if (!localAudioTrack) {
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        },
+        video: false
+      });
+      S.mic = stream;
+      localAudioTrack = stream.getAudioTracks()[0] || null;
+    }
+    if (!localAudioTrack) throw new Error("マイク音声トラックを作成できませんでした。");
+    S.pttActive = false;
+    localAudioTrack.enabled = false;
+    S.session = rid();
+    S.seq = 0;
+    S.sessionBytes = 0;
+    updateMonitorInfo();
+    S.statsFreezeCount = 0;
+    S.hasReceivedVideoFrame = false;
+    // STUN can improve NAT traversal. A TURN relay is still needed on networks
+    // that block direct peer-to-peer UDP traffic.
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" }
+      ]
+    });
+    S.pc = pc;
+    $("camera").disabled = false;
+    S.remoteVideoStream = new MediaStream();
+    $("remoteVideo").muted = true;
+    $("remoteVideo").srcObject = S.remoteVideoStream;
+    prepareAudioOutput();
+    const controlChannel = pc.createDataChannel("remote-control", { ordered: true });
+    S.controlChannel = controlChannel;
+    controlChannel.onopen = () => {
+      $("streamState").textContent = "操作用データチャネル接続済み";
+      S.appliedAdaptiveMode = $("dataMode").value === "auto" ? "standard" : $("dataMode").value;
+      sendControlCommand("quality", {
+        quality: $("quality").value,
+        dataMode: $("dataMode").value === "auto" ? "standard" : $("dataMode").value,
+        captureRatio: $("captureRatio").value,
+        fpsLimit: Number($("fpsLimit").value)
+      }).catch(error => console.debug("Initial capture profile send failed", error));
+      $("refreshStatus").disabled = false;
+      requestDeviceStatus().catch(error => console.debug("Android status request failed", error));
+      if (S.androidStatusTimer) clearInterval(S.androidStatusTimer);
+      S.androidStatusTimer = setInterval(() => {
+        requestDeviceStatus().catch(error => console.debug("Periodic status request failed", error));
+      }, 15000);
+    };
+    controlChannel.onmessage = event => handleControlMessage(event.data);
+    controlChannel.onclose = () => {
+      if (S.controlChannel === controlChannel) S.controlChannel = null;
+      if (S.androidStatusTimer) clearInterval(S.androidStatusTimer);
+      S.androidStatusTimer = null;
+    };
+    pc.addTransceiver("video", { direction: "recvonly" });
+    pc.addTrack(localAudioTrack, stream);
+    pc.ontrack = event => {
+      const track = event.track;
+      if (track.kind === "video") {
+        if (!S.remoteVideoStream.getTracks().some(existing => existing.id === track.id)) {
+          S.remoteVideoStream.addTrack(track);
+        }
+        track.onmute = () => { $("videoState").textContent = "映像一時停止"; };
+        track.onunmute = () => { $("videoState").textContent = "映像再開中"; };
+        track.onended = () => {
+          $("videoState").textContent = "映像トラック終了";
+          scheduleReconnect(pc, true, 1200);
+        };
+        $("placeholder").classList.add("hidden");
+        $("snapshot").disabled = false;
+        startVideoWatchdog(pc);
+        restoreRemotePlayback();
+        if ($("motionEnabled").checked) startMotionDetection();
+      } else if (track.kind === "audio") {
+        if (!S.remoteAudioTracks.some(existing => existing.id === track.id)) {
+          track.enabled = !S.pttActive && !S.remoteAudioMuted;
+          track.onmute = () => { $("audioState").textContent = "Androidマイク一時停止"; };
+          track.onunmute = () => {
+            $("audioState").textContent = "Androidマイク受信中";
+            attachRemoteAudio();
+          };
+          track.onended = () => { $("audioState").textContent = "Androidマイク切断"; };
+          S.remoteAudioTracks.push(track);
+        }
+        attachRemoteAudio();
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      if (S.pc !== pc) return;
+      const state = pc.connectionState;
+      $("iceState").textContent = "ICE: " + state;
+      status(state === "connected" ? "通信接続済み" : state, state === "connected");
+      $("streamState").textContent = state === "connected" ? "通信チャネル接続中" : "接続処理中";
+      if (state === "connected") {
+        sendControlCommand("volume", { percent: S.androidSpeakerVolume }).catch(error => {
+          console.debug("Android speaker volume sync failed", error);
+        });
+        if (S.reconnectTimer) clearTimeout(S.reconnectTimer);
+        S.reconnectTimer = null;
+        if (S.reconnectResetTimer) clearTimeout(S.reconnectResetTimer);
+        // Reset the retry budget only after a genuinely stable connection.
+        S.reconnectResetTimer = setTimeout(() => {
+          if (S.pc === pc && pc.connectionState === "connected") {
+            S.reconnectAttempts = 0;
+          }
+          S.reconnectResetTimer = null;
+        }, 30000);
+        startSessionClock();
+        startViewerHeartbeat();
+        startStatsMonitor(pc);
+        startVideoWatchdog(pc);
+        if ($("motionEnabled").checked) startMotionDetection();
+      } else if (state === "failed" || state === "disconnected" || state === "closed") {
+        if (state === "disconnected") $("streamState").textContent = "通信が不安定です・復帰確認中";
+        if (S.reconnectResetTimer) clearTimeout(S.reconnectResetTimer);
+        S.reconnectResetTimer = null;
+        if (S.connectedAt) stopSessionClock();
+        scheduleReconnect(pc, false, state === "disconnected" ? 8000 : 1500);
+      }
+    };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const iceReady = await waitIce(pc, 25000);
+    if (!iceReady) {
+      throw new Error("ICE候補の収集が25秒以内に完了しませんでした。通信状態を確認して再接続します。");
+    }
+    await api("send_signal", {
+      controllerToken: S.device.controllerToken,
+      deviceId: S.device.deviceId,
+      sessionId: S.session,
+      recipient: "device",
+      kind: "offer",
+      sdp: pc.localDescription.sdp
+    });
+    $("connect").disabled = true;
+    $("disconnect").disabled = false;
+    $("ptt").disabled = false;
+    $("pttLock").disabled = false;
+    $("remoteMute").disabled = false;
+    $("androidSpeakerVolume").disabled = false;
+    $("streamState").textContent = "Android応答待ち";
+    status("接続要求中");
+    pollAnswers();
+  } catch (error) {
+    const permissionDenied = error.name === "NotAllowedError" ||
+      error.name === "PermissionDeniedError" || error.name === "SecurityError";
+    await disconnect(false, !permissionDenied);
+    toast("接続開始失敗: " + error.message);
+    if (permissionDenied) {
+      S.manualDisconnect = true;
+    } else {
+      scheduleReconnect(null);
+    }
+  }
+}
+function startViewerHeartbeat() {
+  if (S.viewerHeartbeatTimer || !S.device) return;
+  const ping = () => {
+    if (!S.device || !S.pc || S.manualDisconnect) return;
+    api("viewer_ping", {
+      controllerToken: S.device.controllerToken,
+      deviceId: S.device.deviceId
+    }).catch(error => console.debug("Viewer heartbeat failed", error));
+  };
+  ping();
+  S.viewerHeartbeatTimer = setInterval(ping, 60000);
+}
+function stopViewerHeartbeat() {
+  if (S.viewerHeartbeatTimer) clearInterval(S.viewerHeartbeatTimer);
+  S.viewerHeartbeatTimer = null;
+}
+
+async function pollAnswers() {
+  const startedAt = Date.now();
+  while (S.pc && S.session && S.device) {
+    if (Date.now() - startedAt > 45000 && S.pc.connectionState !== "connected") {
+      toast("45秒以内にAndroidから応答がありません。接続をやり直します。");
+      scheduleReconnect(S.pc);
+      return;
+    }
+    try {
+      const result = await api("poll_signals", {
+        controllerToken: S.device.controllerToken,
+        deviceId: S.device.deviceId,
+        sessionId: S.session,
+        afterSeq: S.seq
+      });
+      S.seq = Math.max(S.seq, Number(result.latestSeq) || 0);
+      for (const signal of result.signals || []) {
+        S.seq = Math.max(S.seq, Number(signal.seq) || 0);
+        if (signal.kind === "answer" && !S.pc.remoteDescription) {
+          await S.pc.setRemoteDescription({ type: "answer", sdp: signal.sdp });
+          // Non-trickle ICE: no further GAS signal polling is needed after the complete answer.
+          return;
+        } else if (signal.kind === "error") {
+          const reason = String(signal.sdp || "Android側で接続エラーが発生しました。");
+          toast(reason);
+          if (reason.includes("上限")) {
+            // An explicit capacity rejection is not transient: stop this
+            // pending peer and let the user disconnect another viewer first.
+            await disconnect(true);
+          } else {
+            // SDP/RTC failures are session-local. Rebuild only this viewer;
+            // Android keeps the other peer connections alive.
+            scheduleReconnect(S.pc);
+          }
+          return;
+        }
+      }
+    } catch (error) {
+      console.warn("pollAnswers", error);
+      if (error.serverMs !== null && error.serverMs !== undefined) {
+        $("gasTiming").textContent = "GAS処理 " + error.serverMs + " ms / API " + (error.apiVersion || "?");
+      } else {
+        $("gasTiming").textContent = "GAS応答なし（サーバー処理時間不明）";
+      }
+      if (S.pc && S.pc.connectionState === "failed") {
+        scheduleReconnect(S.pc);
+        return;
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, Number(S.cfg.pollIntervalMs) || 2500));
+  }
+}
+async function disconnect(sendCommand = true, preserveMic = false) {
+  if (sendCommand) {
+    S.manualDisconnect = true;
+    if (S.reconnectTimer) clearTimeout(S.reconnectTimer);
+    S.reconnectTimer = null;
+  }
+  stopStatsMonitor();
+  stopViewerHeartbeat();
+  stopVideoWatchdog();
+  stopMotionDetection(true);
+  stopSessionClock();
+  if (S.reconnectResetTimer) clearTimeout(S.reconnectResetTimer);
+  S.reconnectResetTimer = null;
+  if (S.pc && S.device && S.session) {
+    // Send both paths: the direct data-channel message is fast, while a
+    // session-scoped GAS bye survives a data-channel close racing with teardown.
+    if (S.controlChannel && S.controlChannel.readyState === "open") {
+      try {
+        S.controlChannel.send(JSON.stringify({
+          type: "command", name: "disconnect", payload: {}, sessionId: S.session, sentAt: Date.now()
+        }));
+      } catch (error) {
+        console.debug("Direct disconnect message could not be queued", error);
+      }
+    }
+    api("send_signal", {
+      controllerToken: S.device.controllerToken,
+      deviceId: S.device.deviceId,
+      sessionId: S.session,
+      recipient: "device",
+      kind: "bye"
+    }).catch(error => console.debug("Session-scoped bye signal could not be sent", error));
+  }
+  const old = S.pc;
+  S.pc = null;
+  S.session = "";
+  try { if (old) old.close(); } catch (_) {}
+  if (S.controlChannel) {
+    try { S.controlChannel.close(); } catch (_) {}
+    S.controlChannel = null;
+  }
+  if (S.remoteAudioSource) {
+    try { S.remoteAudioSource.disconnect(); } catch (_) {}
+    S.remoteAudioSource = null;
+  }
+  if (S.androidStatusTimer) clearInterval(S.androidStatusTimer);
+  S.androidStatusTimer = null;
+  if (S.wakeLock) {
+    try { await S.wakeLock.release(); } catch (_) {}
+    S.wakeLock = null;
+  }
+  S.keepAwakeWanted = false;
+  $("keepAwake").classList.remove("active");
+  $("keepAwake").textContent = "画面スリープ防止 OFF";
+  S.flashlightOn = false;
+  updateFlashlightButton(false, false);
+  $("androidStatus").textContent = "Android情報：未取得";
+  $("audioState").textContent = "Androidマイク待機中";
+  S.remoteAudioTracks = [];
+  S.remoteVideoStream = null;
+  if (S.mic) {
+    if (preserveMic) {
+      S.mic.getAudioTracks().forEach(track => { track.enabled = false; });
+    } else {
+      S.mic.getTracks().forEach(track => track.stop());
+      S.mic = null;
+    }
+  }
+  S.pttActive = false;
+  if (S.pttSafetyTimer) clearTimeout(S.pttSafetyTimer);
+  S.pttSafetyTimer = null;
+  S.remoteAudioTracks = [];
+  $("remoteVideo").srcObject = null;
+  $("remoteVideo").muted = true;
+  $("snapshot").disabled = true;
+  $("refreshStatus").disabled = true;
+  $("videoState").textContent = "映像待機中";
+  $("placeholder").classList.remove("hidden");
+  $("connect").disabled = !S.device;
+  $("disconnect").disabled = true;
+  $("camera").disabled = true;
+  $("ptt").disabled = true;
+  $("pttLock").disabled = true;
+  $("remoteMute").disabled = true;
+  $("androidSpeakerVolume").disabled = true;
+  S.pttLocked = false;
+  S.remoteAudioMuted = false;
+  $("pttLock").textContent = "送話ロック OFF";
+  $("remoteMute").textContent = "🔊 Android音声 ON";
+  stopAudioMeter();
+  $("ptt").classList.remove("active");
+  $("ptt").textContent = "押している間だけ話す";
+  $("streamState").textContent = "切断済み";
+  $("iceState").textContent = "ICE: --";
+  if (S.reconnectAttempts >= 5 && !sendCommand) {
+    $("streamState").textContent = "再接続上限到達";
+  }
+  if (S.device) status("ペアリング済み");
+  else status("未ペアリング");
+}
+function ptt(enabled) {
+  const track = S.mic && S.mic.getAudioTracks()[0];
+  if (!track) {
+    if (S.pttSafetyTimer) clearTimeout(S.pttSafetyTimer);
+    S.pttSafetyTimer = null;
+    S.pttActive = false;
+    if ($("ptt")) {
+      $("ptt").classList.remove("active");
+      $("ptt").textContent = "🎙 押している間だけ話す";
+    }
+    return;
+  }
+  if (S.pttSafetyTimer) clearTimeout(S.pttSafetyTimer);
+  S.pttSafetyTimer = null;
+  S.pttActive = enabled;
+  track.enabled = enabled;
+  // Half-duplex: mute the Android return audio while sending PTT audio.
+  S.remoteAudioTracks.forEach(remoteTrack => { remoteTrack.enabled = !enabled && !S.remoteAudioMuted; });
+  $("ptt").classList.toggle("active", enabled);
+  $("ptt").textContent = enabled ? "🎙 送話中…" : "🎙 押している間だけ話す";
+  if (enabled) {
+    // Safety release prevents a stuck pointer or forgotten PTT lock from transmitting indefinitely.
+    S.pttSafetyTimer = setTimeout(() => {
+      S.pttLocked = false;
+      $("pttLock").textContent = "送話ロック OFF";
+      ptt(false);
+      toast("安全のため送話を自動停止しました（3分）。");
+    }, 180000);
+  }
+}
+async function loadSettings() {
+  if (!S.device) return;
+  const result = await api("get_settings", {
+    controllerToken: S.device.controllerToken,
+    deviceId: S.device.deviceId
+  });
+  const settings = result.settings || {};
+  $("quality").value = settings.quality || "720";
+  $("dataMode").value = settings.dataMode || "standard";
+  $("captureRatio").value = settings.captureRatio || "16:9";
+  $("fpsLimit").value = String(settings.fpsLimit || 24);
+  updateCaptureAspectRatio();
+  S.captureRatio = $("captureRatio").value;
+  S.fpsLimit = Number($("fpsLimit").value);
+  $("connectedLoc").checked = !!settings.connectedLocationEnabled;
+  $("idleLoc").checked = !!settings.idleLocationEnabled;
+  $("connectedInterval").value = String(settings.connectedInterval || 30);
+  $("idleInterval").value = String(settings.idleInterval || 300);
+}
+async function saveSettings() {
+  if (!S.device) return toast("Android端末をペアリングしてください。");
+  S.captureRatio = $("captureRatio").value;
+  S.fpsLimit = Number($("fpsLimit").value);
+  const settings = {
+    quality: $("quality").value,
+    dataMode: $("dataMode").value,
+    captureRatio: S.captureRatio,
+    fpsLimit: S.fpsLimit,
+    connectedLocationEnabled: $("connectedLoc").checked,
+    idleLocationEnabled: $("idleLoc").checked,
+    connectedInterval: Number($("connectedInterval").value),
+    idleInterval: Number($("idleInterval").value)
+  };
+
+  // Apply changes over the active peer before starting a background GAS write.
+  const direct = !!(S.controlChannel && S.controlChannel.readyState === "open");
+  if (direct) {
+    await sendControlCommand("quality", {
+      quality: settings.quality,
+      dataMode: settings.dataMode === "auto" ? "standard" : settings.dataMode,
+      captureRatio: settings.captureRatio,
+      fpsLimit: settings.fpsLimit
+    });
+    await sendControlCommand("location_settings", settings);
+    toast("Androidに設定を反映しました。GASへ保存中…");
+    S.settingsSaveChain = S.settingsSaveChain
+      .catch(() => {})
+      .then(() => api("save_settings", {
+        controllerToken: S.device.controllerToken,
+        deviceId: S.device.deviceId,
+        settings
+      }));
+    S.settingsSaveChain.then(() => toast("設定を反映し、GASにも保存しました。"))
+      .catch(error => toast("Androidには反映済みですが、GAS保存に失敗しました：" + error.message));
+    return;
+  }
+
+  S.settingsSaveChain = S.settingsSaveChain
+    .catch(() => {})
+    .then(() => api("save_settings", {
+      controllerToken: S.device.controllerToken,
+      deviceId: S.device.deviceId,
+      settings
+    }));
+  await S.settingsSaveChain;
+  await sendControlCommand("quality", {
+    quality: settings.quality,
+    dataMode: settings.dataMode === "auto" ? "standard" : settings.dataMode,
+    captureRatio: settings.captureRatio,
+    fpsLimit: settings.fpsLimit
+  });
+  await sendControlCommand("location_settings", settings);
+  toast("設定を保存しました。");
+}
+async function sendControlCommand(name, payload = {}) {
+  if (S.controlChannel && S.controlChannel.readyState === "open") {
+    const requestId = rid();
+    S.controlChannel.send(JSON.stringify({
+      type: "command",
+      name,
+      payload,
+      requestId,
+      sentAt: Date.now()
+    }));
+    return { delivered: "webrtc", requestId };
+  }
+  if (!S.device) throw Error("Android端末をペアリングしてください。");
+  return api("send_command", {
+    controllerToken: S.device.controllerToken,
+    deviceId: S.device.deviceId,
+    command: name,
+    payload
+  });
+}
+
+async function command(name, payload = {}) {
+  if (!S.device) return toast("Android端末をペアリングしてください。");
+  await sendControlCommand(name, payload);
+  toast(S.controlChannel && S.controlChannel.readyState === "open"
+    ? "WebRTCでAndroidへ直接命令しました。"
+    : "GAS経由でAndroidへ命令しました。");
+}
+
+async function unpairSelectedDevice() {
+  if (!S.device) return;
+  if (!confirm("このブラウザーの閲覧権限だけを解除します。他のiPad・PCの監視接続には影響しません。よろしいですか？")) return;
+  const selected = S.device;
+  S.manualDisconnect = true;
+  if (S.reconnectTimer) clearTimeout(S.reconnectTimer);
+  S.reconnectTimer = null;
+  $("unpair").disabled = true;
+  try {
+    if (S.pc && S.session) {
+      // Use both transports before revoking this viewer token. A failed direct
+      // data-channel send must not strand its Android peer until ICE timeout.
+      if (S.controlChannel && S.controlChannel.readyState === "open") {
+        try {
+          S.controlChannel.send(JSON.stringify({
+            type: "command", name: "disconnect", payload: {}, sessionId: S.session, sentAt: Date.now()
+          }));
+        } catch (error) {
+          console.debug("Direct viewer unpair disconnect could not be queued", error);
+        }
+      }
+      await api("send_signal", {
+        controllerToken: selected.controllerToken,
+        deviceId: selected.deviceId,
+        sessionId: S.session,
+        recipient: "device",
+        kind: "bye"
+      }).catch(error => console.debug("Session-scoped unpair bye could not be sent", error));
+    }
+    await api("unpair_device", {
+      controllerToken: selected.controllerToken,
+      deviceId: selected.deviceId
+    });
+    await disconnect(false);
+    S.devices = S.devices.filter(device => device.deviceId !== selected.deviceId);
+    saveDevices();
+    storageRemove(SELECTED_KEY);
+    S.device = null;
+    refreshDeviceList();
+    status("このブラウザーの登録解除済み");
+    toast("このブラウザーの閲覧権限だけを解除しました。");
+  } catch (error) {
+    toast("登録解除失敗: " + error.message);
+    $("unpair").disabled = false;
+  }
+}
+
+async function loadViewerList() {
+  if (!S.device) return;
+  const result = await api("get_controllers", {
+    controllerToken: S.device.controllerToken,
+    deviceId: S.device.deviceId
+  });
+  const rows = $("viewerRows");
+  rows.replaceChildren();
+  for (const viewer of result.controllers || []) {
+    const row = document.createElement("div");
+    row.className = "viewerrow";
+    const name = document.createElement("b");
+    const detail = document.createElement("small");
+    name.textContent = viewer.controllerName + (viewer.current ? "（このブラウザー）" : "");
+    const last = viewer.lastSeen ? new Date(viewer.lastSeen).toLocaleString() : "履歴なし";
+    detail.textContent = (viewer.online ? "● オンライン確認済み" : "○ 最近の応答なし") + " · 最終確認 " + last;
+    row.append(name, detail);
+    rows.appendChild(row);
+  }
+  $("viewerCount").textContent = "閲覧端末: " + (result.viewerCount || 0) + "/" + (result.maxViewers || 3);
+  $("viewerSummary").textContent = "このAndroidには最大" + (result.maxViewers || 3) +
+    "台まで登録できます。登録コードはAndroid側で再発行してから、追加する端末で入力してください。";
+  $("viewersDialog").showModal();
+}
+
+async function loadHistory() {
+  if (!S.device) return toast("Android端末をペアリングしてください。");
+  const result = await api("get_locations", {
+    controllerToken: S.device.controllerToken,
+    deviceId: S.device.deviceId,
+    limit: 500
+  });
+  S.history = result.locations || [];
+  $("historyRows").replaceChildren();
+  for (const point of [...S.history].reverse()) {
+    const row = document.createElement("div");
+    const span = document.createElement("span");
+    const button = document.createElement("button");
+    row.className = "historyrow";
+    span.textContent = new Date(point.timestamp).toLocaleString() + " · " +
+      Number(point.lat).toFixed(5) + ", " + Number(point.lng).toFixed(5);
+    button.textContent = "地図";
+    button.type = "button";
+    button.addEventListener("click", () => {
+      showMap();
+      drawMap([point]);
+      $("historyDialog").close();
+    });
+    row.append(span, button);
+    $("historyRows").append(row);
+  }
+  showMap();
+  drawMap(S.history);
+  $("historyDialog").showModal();
+}
+function initMap() {
+  if (S.map || !window.L) return;
+  S.map = L.map("map").setView([35.6812, 139.7671], 5);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+  }).addTo(S.map);
+}
+function showMap() {
+  $("videoPane").classList.add("hidden");
+  $("mapPane").classList.remove("hidden");
+  $("mapTab").classList.add("active");
+  $("videoTab").classList.remove("active");
+  initMap();
+  setTimeout(() => { if (S.map) S.map.invalidateSize(); }, 100);
+}
+function showVideo() {
+  $("mapPane").classList.add("hidden");
+  $("videoPane").classList.remove("hidden");
+  $("videoTab").classList.add("active");
+  $("mapTab").classList.remove("active");
+  window.setTimeout(updateMotionOverlayLayout, 80);
+}
+function drawMap(points) {
+  initMap();
+  if (!S.map) return;
+  if (S.marker) S.marker.remove();
+  if (S.route) S.route.remove();
+  const valid = points.filter(point =>
+    Number.isFinite(Number(point.lat)) && Number.isFinite(Number(point.lng))
+  );
+  if (!valid.length) {
+    S.lastLocation = null;
+    $("locationInfo").textContent = "位置情報はありません。";
+    return;
+  }
+  const last = valid[valid.length - 1];
+  S.lastLocation = last;
+  S.marker = L.marker([last.lat, last.lng]).addTo(S.map);
+  if (valid.length > 1) {
+    S.route = L.polyline(valid.map(point => [point.lat, point.lng]), { color: "#2865d6" }).addTo(S.map);
+  }
+  const ageSeconds = Math.max(0, Math.round((Date.now() - new Date(last.timestamp).getTime()) / 1000));
+  $("locationInfo").textContent = "最終取得: " + new Date(last.timestamp).toLocaleString() +
+    " / 精度 ±" + (last.accuracy || "?") + "m / " + ageSeconds + "秒前 / " + (last.mode || "取得");
+  if (S.followMap) {
+    if (S.route) S.map.fitBounds(S.route.getBounds().pad(0.15));
+    else S.map.setView([last.lat, last.lng], 15);
+  }
+}
+async function deleteHistory() {
+  if (!S.device || !confirm("この端末の位置情報履歴をすべて削除します。よろしいですか？")) return;
+  const result = await api("delete_locations", {
+    controllerToken: S.device.controllerToken,
+    deviceId: S.device.deviceId,
+    all: true
+  });
+  S.history = [];
+  drawMap([]);
+  toast("履歴を " + (result.deleted || 0) + " 件削除しました。");
+}
+
+window.addEventListener("offline", () => {
+  status("ネットワーク切断中", false);
+  $("streamState").textContent = "ネットワーク復帰待ち";
+});
+window.addEventListener("online", () => {
+  toast("ネットワークが復帰しました。接続状態を確認します。");
+  if (S.pc && ["disconnected", "failed", "closed"].includes(S.pc.connectionState)) {
+    scheduleReconnect(S.pc);
+  }
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") {
+    if (S.motionTimer) stopMotionDetection(true);
+    if ($("motionEnabled") && $("motionEnabled").checked)
+      $("motionState").textContent = "バックグラウンドではOSの制御により検知を一時停止します";
+    return;
+  }
+  if (S.audioContext && S.audioContext.state === "suspended")
+    S.audioContext.resume().catch(error => console.debug("AudioContext resume failed", error));
+  if (S.keepAwakeWanted && !S.wakeLock) enableScreenWakeLock().catch(() => {});
+  window.setTimeout(restoreRemotePlayback, 180);
+  updateMotionOverlayLayout();
+  if (!S.pc) return;
+  const state = S.pc.connectionState;
+  if (["disconnected", "failed", "closed"].includes(state)) scheduleReconnect(S.pc);
+  if ($("motionEnabled").checked) { S.motionPrevious = null; startMotionDetection(); }
+});
+
+document.addEventListener("fullscreenchange", () => {
+  window.setTimeout(restoreRemotePlayback, 180);
+  window.setTimeout(updateMotionOverlayLayout, 180);
+});
+document.addEventListener("webkitfullscreenchange", () => {
+  window.setTimeout(restoreRemotePlayback, 180);
+  window.setTimeout(updateMotionOverlayLayout, 180);
+});
+$("remoteVideo").addEventListener("webkitendfullscreen", () => window.setTimeout(restoreRemotePlayback, 350));
+window.addEventListener("pageshow", () => window.setTimeout(restoreRemotePlayback, 180));
+window.addEventListener("resize", () => {
+  updateMotionOverlayLayout();
+  if (S.pc && S.remoteVideoStream) window.setTimeout(restoreRemotePlayback, 150);
+});
+$("remoteVideo").addEventListener("loadedmetadata", updateMotionOverlayLayout);
+$("remoteVideo").addEventListener("resize", updateMotionOverlayLayout);
+document.addEventListener("DOMContentLoaded", async () => {
+  registerPwa();
+  $("refresh").addEventListener("click", refreshDeviceList);
+  $("pair").addEventListener("click", () => $("pairDialog").showModal());
+  $("pairQuick").addEventListener("click", () => $("pair").click());
+  $("unpair").addEventListener("click", () => unpairSelectedDevice());
+  $("viewers").addEventListener("click", () => loadViewerList().catch(error => toast(error.message)));
+  $("claim").addEventListener("click", claimDevice);
+  $("connect").addEventListener("click", connect);
+  $("disconnect").addEventListener("click", () => disconnect(true));
+  $("ptt").addEventListener("pointerdown", event => {
+    event.preventDefault();
+    try { if (event.pointerId !== undefined) $("ptt").setPointerCapture(event.pointerId); } catch (_) {}
+    if (S.pttLocked) { S.pttLocked = false; $("pttLock").textContent = "送話ロック OFF"; ptt(false); return; }
+    ptt(true);
+  });
+  ["pointerup", "pointercancel", "lostpointercapture"].forEach(name => {
+    $("ptt").addEventListener(name, () => { if (!S.pttLocked) ptt(false); });
+  });
+  $("ptt").addEventListener("keydown", event => {
+    if (event.code === "Space" || event.key === "Enter") {
+      event.preventDefault();
+      if (!S.pttLocked) ptt(true);
+    }
+  });
+  $("ptt").addEventListener("keyup", event => {
+    if ((event.code === "Space" || event.key === "Enter") && !S.pttLocked) {
+      event.preventDefault();
+      ptt(false);
+    }
+  });
+  $("pttLock").addEventListener("click", () => {
+    if (!S.mic || !S.mic.getAudioTracks()[0]) return;
+    S.pttLocked = !S.pttLocked;
+    $("pttLock").textContent = S.pttLocked ? "🔒 送話ロック ON" : "送話ロック OFF";
+    ptt(S.pttLocked);
+  });
+  $("remoteMute").addEventListener("click", () => {
+    S.remoteAudioMuted = !S.remoteAudioMuted;
+    S.remoteAudioTracks.forEach(track => { track.enabled = !S.remoteAudioMuted && !S.pttActive; });
+    $("remoteMute").textContent = S.remoteAudioMuted ? "🔇 Android音声 OFF" : "🔊 Android音声 ON";
+  });
+  $("saveSettings").addEventListener("click", () => saveSettings().catch(error => toast(error.message)));
+  $("locate").addEventListener("click", () => command("location_once").catch(error => toast(error.message)));
+  $("history").addEventListener("click", () => loadHistory().catch(error => toast(error.message)));
+  $("deleteHistory").addEventListener("click", () => deleteHistory().catch(error => toast(error.message)));
+  S.motionEvents = readMotionEvents();
+  S.motionZones = readMotionZones();
+  S.motionSelectedZoneId = S.motionZones[0]?.id || "";
+  $("motionEnabled").checked = storageGet("rc_motion_enabled_v42", "0") === "1";
+  $("personCandidateEnabled").checked = storageGet("rc_person_candidate_v451", "1") !== "0";
+  $("personEntryEnabled").checked = storageGet("rc_person_entry_v451", "1") !== "0";
+  $("personExitEnabled").checked = storageGet("rc_person_exit_v451", "1") !== "0";
+  renderMotionZones();
+  $("motionEnabled").addEventListener("change", event => {
+    const enabled = event.target.checked;
+    storageSet("rc_motion_enabled_v42", enabled ? "1" : "0");
+    if (enabled) {
+      if (S.pc && !document.hidden) startMotionDetection();
+      else $("motionState").textContent = "接続後・画面表示中に解析を開始します";
+    } else stopMotionDetection(false);
+  });
+  $("addMotionZone").addEventListener("click", beginMotionZoneDrawing);
+  $("cancelMotionZone").addEventListener("click", () => setMotionDrawingMode(false));
+  $("saveMotionZone").addEventListener("click", saveSelectedMotionZone);
+  $("motionZoneName").addEventListener("change", saveSelectedMotionZone);
+  $("motionZoneSensitivity").addEventListener("change", saveSelectedMotionZone);
+  $("motionZoneEnabled").addEventListener("change", saveSelectedMotionZone);
+  $("deleteMotionZone").addEventListener("click", deleteSelectedMotionZone);
+  $("motionOverlay").addEventListener("pointerdown", handleMotionPointerDown);
+  $("motionOverlay").addEventListener("pointermove", handleMotionPointerMove);
+  $("motionOverlay").addEventListener("pointerup", handleMotionPointerUp);
+  $("motionOverlay").addEventListener("pointercancel", () => { S.motionDraft=null; setMotionDrawingMode(false); });
+  $("personCandidateEnabled").addEventListener("change", event => {
+    storageSet("rc_person_candidate_v451", event.target.checked ? "1" : "0");
+    S.personZoneStates = {};
+  });
+  $("personEntryEnabled").addEventListener("change", event =>
+    storageSet("rc_person_entry_v451", event.target.checked ? "1" : "0"));
+  $("personExitEnabled").addEventListener("change", event =>
+    storageSet("rc_person_exit_v451", event.target.checked ? "1" : "0"));
+  $("motionNotifications").addEventListener("click", requestMotionNotifications);
+  $("motionEvents").addEventListener("click", showMotionEvents);
+  $("exportMotionEvents").addEventListener("click", exportMotionEvents);
+  $("imageViewerDownload").addEventListener("click", saveImageViewer);
+  $("imageViewerFullscreen").addEventListener("click", () => toggleImageFullscreen());
+  $("imageViewerClose").addEventListener("click", () => {
+    if ($("imageViewerDialog").open) $("imageViewerDialog").close();
+  });
+  $("imageViewerDialog").addEventListener("close", () => {
+    if (document.fullscreenElement === $("imageViewerDialog") && document.exitFullscreen) {
+      document.exitFullscreen().catch(() => {});
+    }
+    releaseImageViewerSource();
+    notifyBookmarkletPanel("restore-panel");
+  });
+  $("videoTab").addEventListener("click", showVideo);
+  $("mapTab").addEventListener("click", showMap);
+  $("fullscreen").addEventListener("click", toggleFullscreen);
+  $("snapshot").addEventListener("click", takeSnapshot);
+  $("flashlight").addEventListener("click", toggleFlashlight);
+  $("keepAwake").addEventListener("click", toggleScreenWakeLock);
+  $("refreshStatus").addEventListener("click", () => requestDeviceStatus()
+    .then(() => toast("Android端末情報を更新しています…"))
+    .catch(error => toast(error.message)));
+  $("viewerZoom").addEventListener("input", event => {
+    S.zoom = Math.max(1, Math.min(2.5, Number(event.target.value) / 100));
+    updateViewerTransform();
+  });
+  $("fitMode").addEventListener("click", () => {
+    S.fitMode = S.fitMode === "contain" ? "cover" : "contain";
+    $("fitMode").textContent = S.fitMode === "contain" ? "全体表示" : "画面に合わせる";
+    updateViewerTransform();
+  });
+  $("mapFollow").addEventListener("change", event => {
+    S.followMap = event.target.checked;
+    if (S.followMap && S.lastLocation && S.map) {
+      S.map.setView([S.lastLocation.lat, S.lastLocation.lng], 15);
+    }
+  });
+  $("copyLocation").addEventListener("click", copyCoordinates);
+  updateCaptureAspectRatio();
+  updateMonitorInfo();
+  const storedVolume = storageGet("rc_receive_volume_v1", null);
+  const savedVolume = storedVolume === null ? 70 : Number(storedVolume);
+  setReceiveVolume(Number.isFinite(savedVolume) ? savedVolume : 70, false);
+  $("volume").addEventListener("input", event => setReceiveVolume(Number(event.target.value), true));
+  const storedVoiceClean = storageGet("rc_voice_clean_v422", "0");
+  const initialVoiceClean = Number(storedVoiceClean);
+  S.voiceCleanLevel = Number.isFinite(initialVoiceClean) ? Math.max(0, Math.min(100, initialVoiceClean)) : 0;
+  $("voiceClean").value = String(S.voiceCleanLevel);
+  updateVoiceCleaning();
+  $("voiceClean").addEventListener("input", event => {
+    S.voiceCleanLevel = Math.max(0, Math.min(100, Number(event.target.value) || 0));
+    updateVoiceCleaning();
+    storageSet("rc_voice_clean_v422", String(S.voiceCleanLevel));
+  });
+  const storedAndroidSpeakerVolume = storageGet("rc_android_speaker_volume_v1", null);
+  const savedAndroidSpeakerVolume = storedAndroidSpeakerVolume === null ? 70 : Number(storedAndroidSpeakerVolume);
+  S.androidSpeakerVolume = Number.isFinite(savedAndroidSpeakerVolume)
+    ? Math.max(0, Math.min(100, savedAndroidSpeakerVolume)) : 70;
+  $("androidSpeakerVolume").value = String(S.androidSpeakerVolume);
+  $("androidSpeakerVolumeValue").textContent = S.androidSpeakerVolume + "%";
+  $("androidSpeakerVolume").addEventListener("input", event => {
+    S.androidSpeakerVolume = Math.max(0, Math.min(100, Number(event.target.value) || 0));
+    $("androidSpeakerVolumeValue").textContent = S.androidSpeakerVolume + "%";
+    try { localStorage.setItem(storageKey("rc_android_speaker_volume_v1"), String(S.androidSpeakerVolume)); } catch (_) {}
+  });
+  $("androidSpeakerVolume").addEventListener("change", () => {
+    if (!S.pc) return toast("Androidスピーカー音量は接続後に反映できます。");
+    sendControlCommand("volume", { percent: S.androidSpeakerVolume })
+      .then(() => toast("Android側の送話再生音量を変更しました。"))
+      .catch(error => toast("Android音量変更失敗：" + error.message));
+  });
+  $("camera").addEventListener("change", event => {
+    command("camera", { facing: event.target.value }).catch(error => toast(error.message));
+  });
+  $("quality").addEventListener("change", () => saveSettings().catch(error => toast(error.message)));
+  $("dataMode").addEventListener("change", () => {
+    S.adaptiveStableSince = 0;
+    S.appliedAdaptiveMode = $("dataMode").value === "auto" ? "standard" : $("dataMode").value;
+    saveSettings().catch(error => toast(error.message));
+  });
+  $("captureRatio").addEventListener("change", () => {
+    updateCaptureAspectRatio();
+    saveSettings().catch(error => toast(error.message));
+  });
+  $("fpsLimit").addEventListener("change", () => saveSettings().catch(error => toast(error.message)));
+  $("refreshStatus").disabled = true;
+  updateViewerTransform();
+  updateMotionOverlayLayout();
+  try {
+    await loadConfig();
+    S.devices = readDevices();
+    renderDevices();
+    try {
+      const health = await api("health");
+      const expectedApiVersion = String(S.cfg.appVersion || "");
+      const actualApiVersion = String(health.apiVersion || health.version || "");
+      if (expectedApiVersion && actualApiVersion !== expectedApiVersion) {
+        $("pair").disabled = true;
+        $("pairQuick").disabled = true;
+        setControlsEnabled(false);
+        status("GASバージョン不一致");
+        toast("Webはv" + expectedApiVersion + "、GASはv" +
+          (actualApiVersion || "旧版／未対応") +
+          "です。Apps ScriptのCode.gsをv" + expectedApiVersion +
+          "へ更新し、新しいバージョンとして再デプロイしてください。");
+      } else if (!health.databaseReady) {
+        $("pair").disabled = true;
+        $("pairQuick").disabled = true;
+        setControlsEnabled(false);
+        status("GAS接続済み・DB未設定");
+        toast(health.message || "GASのsetupDatabase()を実行し、最新バージョンをデプロイしてください。");
+      } else {
+        $("pair").disabled = false;
+        $("pairQuick").disabled = false;
+        refreshDeviceList();
+        status(S.device ? "ペアリング済み" : "GAS接続済み・端末未登録", true);
+      }
+    } catch (healthError) {
+      $("pair").disabled = true;
+      $("pairQuick").disabled = true;
+      setControlsEnabled(false);
+      status("GAS応答なし");
+      toast("GASへのPOST応答を確認できません: " + (healthError && healthError.message ? healthError.message : "不明な通信エラー") + "。Code.gsの更新・再デプロイも確認してください。");
+      console.error("GAS health check failed", healthError);
+    }
+  } catch (error) {
+    $("pair").disabled = true;
+    $("pairQuick").disabled = true;
+    setControlsEnabled(false);
+    toast(error.message);
+    status("設定エラー");
+  }
+});
