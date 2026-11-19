@@ -5,7 +5,7 @@ Android・iPad・Windows PC向けの遠隔監視カメラシステムです。v4
 ## 🌐 デモ
 GitHub Pages: https://a09848281-prog.github.io/a/
 
-デプロイ完了後にアクセスしてください。GitHub Pagesの初回有効化やActions実行が完了するまでは公開URLが利用できない場合があります。
+初回公開前にGitHubリポジトリの Settings → Pages → Build and deployment → Source を「GitHub Actions」に設定してください。GitHub Pagesが有効になりDeployが成功した後にアクセスできます。
 
 ## 📦 含まれるもの
 - web/ — iPad / PC用Webアプリ（PWA）
